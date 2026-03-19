@@ -63,6 +63,16 @@ import {
 } from './core/mediaLibraryStore';
 import { generateImagesToMediaLibrary } from './core/imageGenerationService';
 import { getRedClawBackgroundRunner } from './core/redclawBackgroundRunner';
+import { detectAiProtocol, fetchModelsForAiSource, testAiSourceConnection } from './core/aiSourceService';
+import {
+  getMcpServers,
+  saveMcpServers,
+  testMcpServerConnection,
+  discoverLocalMcpConfigs,
+  importLocalMcpServers,
+  getMcpOAuthStatus,
+  type McpServerConfig,
+} from './core/mcpStore';
 
 // The built directory structure
 process.env.DIST = path.join(__dirname, '../dist')
@@ -374,24 +384,138 @@ ipcMain.handle('memory:update', async (_, { id, updates }) => {
   return updateUserMemoryInFile(id, updates);
 });
 
-// Fetch Models
-ipcMain.handle('ai:fetch-models', async (_, { apiKey, baseURL }) => {
+// MCP
+ipcMain.handle('mcp:list', async () => {
+  return { success: true, servers: getMcpServers() };
+});
+
+ipcMain.handle('mcp:save', async (_, payload: { servers?: McpServerConfig[] }) => {
   try {
-    const url = `${baseURL}/models`;
-    const response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      }
-    });
+    const servers = saveMcpServers(Array.isArray(payload?.servers) ? payload.servers : []);
+    return { success: true, servers };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message, servers: [] };
+  }
+});
 
-    if (!response.ok) {
-      throw new Error(`Failed to fetch models: ${response.statusText}`);
+ipcMain.handle('mcp:test', async (_, payload: { server?: McpServerConfig }) => {
+  try {
+    if (!payload?.server) {
+      return { success: false, message: 'server is required' };
     }
+    return await testMcpServerConnection(payload.server);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, message };
+  }
+});
 
-    const data = await response.json();
-    // Support OpenAI format { data: [{ id: 'model-id' }] }
-    return data.data || [];
+ipcMain.handle('mcp:discover-local', async () => {
+  try {
+    const items = await discoverLocalMcpConfigs();
+    return {
+      success: true,
+      items: items.map((item) => ({
+        sourcePath: item.sourcePath,
+        count: item.servers.length,
+        servers: item.servers,
+      })),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message, items: [] };
+  }
+});
+
+ipcMain.handle('mcp:import-local', async () => {
+  try {
+    const result = await importLocalMcpServers();
+    return { success: true, ...result };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message };
+  }
+});
+
+ipcMain.handle('mcp:oauth-status', async (_, payload: { serverId?: string }) => {
+  try {
+    const serverId = String(payload?.serverId || '').trim();
+    if (!serverId) {
+      return { success: false, error: 'serverId is required' };
+    }
+    const status = await getMcpOAuthStatus(serverId);
+    return { success: true, ...status };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message };
+  }
+});
+
+// AI Source: protocol detect / test / model list
+ipcMain.handle('ai:detect-protocol', async (_, payload: {
+  baseURL?: string;
+  presetId?: string;
+  protocol?: string;
+}) => {
+  try {
+    return {
+      success: true,
+      protocol: detectAiProtocol({
+        baseURL: payload?.baseURL || '',
+        presetId: payload?.presetId,
+        protocol: payload?.protocol,
+      }),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, protocol: 'openai', error: message };
+  }
+});
+
+ipcMain.handle('ai:test-connection', async (_, payload: {
+  apiKey?: string;
+  baseURL?: string;
+  presetId?: string;
+  protocol?: 'openai' | 'anthropic' | 'gemini';
+}) => {
+  try {
+    const result = await testAiSourceConnection({
+      apiKey: payload?.apiKey || '',
+      baseURL: payload?.baseURL || '',
+      presetId: payload?.presetId,
+      protocol: payload?.protocol,
+    });
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      success: false,
+      protocol: detectAiProtocol({
+        baseURL: payload?.baseURL || '',
+        presetId: payload?.presetId,
+        protocol: payload?.protocol,
+      }),
+      models: [],
+      message,
+    };
+  }
+});
+
+ipcMain.handle('ai:fetch-models', async (_, payload: {
+  apiKey?: string;
+  baseURL?: string;
+  presetId?: string;
+  protocol?: 'openai' | 'anthropic' | 'gemini';
+}) => {
+  try {
+    const { models } = await fetchModelsForAiSource({
+      apiKey: payload?.apiKey || '',
+      baseURL: payload?.baseURL || '',
+      presetId: payload?.presetId,
+      protocol: payload?.protocol,
+    });
+    return models;
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(message);
@@ -798,6 +922,101 @@ ipcMain.handle('chat:compact-context', async (event, sessionId: string) => {
   } catch (error) {
     console.error('[chat:compact-context] Failed:', error);
     return { success: false, compacted: false, message: String(error) };
+  }
+});
+
+ipcMain.handle('chat:get-context-usage', async (_, sessionId: string) => {
+  if (!sessionId) {
+    return {
+      success: false,
+      error: 'sessionId is required',
+    };
+  }
+
+  const session = getChatSession(sessionId);
+  const messages = getChatMessages(sessionId).filter((msg) => msg.role === 'user' || msg.role === 'assistant');
+  const estimateTokens = (text: string) => Math.ceil(String(text || '').length / 4);
+
+  let metadata: Record<string, unknown> = {};
+  if (session?.metadata) {
+    try {
+      metadata = JSON.parse(session.metadata) as Record<string, unknown>;
+    } catch {
+      metadata = {};
+    }
+  }
+
+  const compactBaseMessageCount = Number(metadata.compactBaseMessageCount || 0);
+  const compactSummary = String(metadata.compactSummary || '');
+  const compactSummaryTokens = compactSummary ? estimateTokens(compactSummary) : 0;
+  const activeMessages = messages.slice(Math.max(0, Math.min(messages.length, compactBaseMessageCount)));
+  const activeHistoryTokens = activeMessages.reduce((acc, msg) => acc + estimateTokens(msg.content || ''), 0);
+  const estimatedTotalTokens = activeHistoryTokens + compactSummaryTokens;
+
+  const settings = (getSettings() || {}) as Record<string, unknown>;
+  const compactThreshold = Number(settings.redclaw_compact_target_tokens || 256000);
+  const compactRounds = Number(metadata.compactRounds || 0);
+  const compactUpdatedAt = String(metadata.compactUpdatedAt || '');
+  const compactRatio = compactThreshold > 0 ? estimatedTotalTokens / compactThreshold : 0;
+
+  return {
+    success: true,
+    sessionId,
+    contextType: String(metadata.contextType || ''),
+    messageCount: messages.length,
+    compactBaseMessageCount,
+    compactRounds,
+    compactUpdatedAt: compactUpdatedAt || null,
+    estimatedTotalTokens,
+    compactSummaryTokens,
+    activeHistoryTokens,
+    compactThreshold,
+    compactRatio: Number.isFinite(compactRatio) ? compactRatio : 0,
+  };
+});
+
+ipcMain.handle('chat:get-runtime-state', async (event, sessionId: string) => {
+  if (!sessionId) {
+    return {
+      success: false,
+      error: 'sessionId is required',
+      isProcessing: false,
+      partialResponse: '',
+      updatedAt: 0,
+    };
+  }
+
+  try {
+    const service = chatServices.get(sessionId);
+    if (!service) {
+      return {
+        success: true,
+        sessionId,
+        isProcessing: false,
+        partialResponse: '',
+        updatedAt: 0,
+      };
+    }
+    const browserWindow = BrowserWindow.fromWebContents(event.sender);
+    if (browserWindow) {
+      service.setWindow(browserWindow);
+    }
+    const runtime = service.getRuntimeState();
+    return {
+      success: true,
+      sessionId,
+      isProcessing: Boolean(runtime.isProcessing),
+      partialResponse: runtime.partialResponse || '',
+      updatedAt: Number(runtime.updatedAt || 0),
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: String(error),
+      isProcessing: false,
+      partialResponse: '',
+      updatedAt: 0,
+    };
   }
 });
 

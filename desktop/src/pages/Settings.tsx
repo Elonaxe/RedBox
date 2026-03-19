@@ -1,7 +1,14 @@
-import { useEffect, useState } from 'react';
-import { Save, RefreshCw, CheckCircle2, AlertCircle, FolderOpen, Sparkles, Wrench, Download, LayoutGrid, Cpu, Database, Trash2, Eye, EyeOff, FlaskConical, Info, Brain } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Save, RefreshCw, CheckCircle2, AlertCircle, FolderOpen, Wrench, Download, LayoutGrid, Cpu, Database, Trash2, Eye, EyeOff, FlaskConical, Info, Brain, Plus, Star } from 'lucide-react';
 import clsx from 'clsx';
 import { useFeatureFlags } from '../hooks/useFeatureFlags';
+import {
+  AI_SOURCE_PRESETS,
+  type AiSourceConfig,
+  DEFAULT_AI_PRESET_ID,
+  findAiPresetById,
+  inferPresetIdByEndpoint
+} from '../config/aiSources';
 
 interface UserMemory {
   id: string;
@@ -10,6 +17,155 @@ interface UserMemory {
   tags: string[];
   created_at: number;
 }
+
+type AiProtocol = 'openai' | 'anthropic' | 'gemini';
+
+interface McpServerConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  transport: 'stdio' | 'sse' | 'streamable-http';
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  oauth?: {
+    enabled?: boolean;
+    tokenPath?: string;
+  };
+}
+
+const generateAiSourceId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `ai_source_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const createAiSourceFromPreset = (presetId: string = DEFAULT_AI_PRESET_ID): AiSourceConfig => {
+  const preset = findAiPresetById(presetId) || findAiPresetById(DEFAULT_AI_PRESET_ID);
+  return {
+    id: generateAiSourceId(),
+    name: preset?.label || '自定义 AI 源',
+    presetId: preset?.id || 'custom',
+    baseURL: preset?.baseURL || '',
+    apiKey: '',
+    model: '',
+    protocol: preset?.protocol || 'openai',
+  };
+};
+
+const parseAiSources = (raw: string | undefined): AiSourceConfig[] => {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const normalized = parsed
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+      .map((item) => {
+        const baseURL = String(item.baseURL || item.baseUrl || '');
+        const presetId = String(item.presetId || inferPresetIdByEndpoint(baseURL) || 'custom');
+        return {
+          id: String(item.id || generateAiSourceId()),
+          name: String(item.name || findAiPresetById(presetId)?.label || 'AI 源'),
+          presetId,
+          baseURL,
+          apiKey: String(item.apiKey || item.key || ''),
+          model: String(item.model || item.modelName || ''),
+          protocol: (String(item.protocol || findAiPresetById(presetId)?.protocol || 'openai') as AiProtocol),
+        } satisfies AiSourceConfig;
+      });
+    const seen = new Set<string>();
+    return normalized.filter((source) => {
+      if (seen.has(source.id)) return false;
+      seen.add(source.id);
+      return true;
+    });
+  } catch {
+    return [];
+  }
+};
+
+const generateMcpServerId = () => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `mcp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+};
+
+const createDefaultMcpServer = (): McpServerConfig => ({
+  id: generateMcpServerId(),
+  name: 'New MCP Server',
+  enabled: true,
+  transport: 'stdio',
+  command: '',
+  args: [],
+  env: {},
+  url: '',
+  oauth: {
+    enabled: false,
+  },
+});
+
+const parseMcpServers = (raw: string | undefined): McpServerConfig[] => {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
+      .map((item) => ({
+        id: String(item.id || generateMcpServerId()),
+        name: String(item.name || 'MCP Server'),
+        enabled: item.enabled === undefined ? true : Boolean(item.enabled),
+        transport: (item.transport === 'sse' || item.transport === 'streamable-http' ? item.transport : 'stdio'),
+        command: String(item.command || ''),
+        args: Array.isArray(item.args) ? item.args.map((arg) => String(arg || '').trim()).filter(Boolean) : [],
+        env: item.env && typeof item.env === 'object'
+          ? Object.fromEntries(
+              Object.entries(item.env as Record<string, unknown>)
+                .map(([key, value]) => [key, String(value || '').trim()])
+                .filter(([, value]) => Boolean(value))
+            )
+          : {},
+        url: String(item.url || ''),
+        oauth: item.oauth && typeof item.oauth === 'object'
+          ? {
+              enabled: (item.oauth as Record<string, unknown>).enabled === undefined
+                ? undefined
+                : Boolean((item.oauth as Record<string, unknown>).enabled),
+              tokenPath: String((item.oauth as Record<string, unknown>).tokenPath || ''),
+            }
+          : undefined,
+      }));
+  } catch {
+    return [];
+  }
+};
+
+const stringifyEnvRecord = (env?: Record<string, string>): string => {
+  if (!env) return '';
+  return Object.entries(env)
+    .filter(([key, value]) => Boolean(key.trim()) && Boolean(String(value || '').trim()))
+    .map(([key, value]) => `${key}=${value}`)
+    .join('\n');
+};
+
+const parseEnvText = (raw: string): Record<string, string> => {
+  const lines = String(raw || '').split('\n');
+  const entries: Array<[string, string]> = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const idx = trimmed.indexOf('=');
+    if (idx <= 0) continue;
+    const key = trimmed.slice(0, idx).trim();
+    const value = trimmed.slice(idx + 1).trim();
+    if (!key || !value) continue;
+    entries.push([key, value]);
+  }
+  return Object.fromEntries(entries);
+};
 
 function PasswordInput({
   value,
@@ -65,7 +221,12 @@ export function Settings() {
     image_model: 'gpt-image-1',
     image_size: '1024x1024',
     image_quality: 'standard',
+    redclaw_compact_target_tokens: '256000',
   });
+  const [aiSources, setAiSources] = useState<AiSourceConfig[]>([]);
+  const [defaultAiSourceId, setDefaultAiSourceId] = useState('');
+  const [activeAiSourceId, setActiveAiSourceId] = useState('');
+  const [detectedAiProtocol, setDetectedAiProtocol] = useState<AiProtocol>('openai');
 
   const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
   const [isTesting, setIsTesting] = useState(false);
@@ -73,10 +234,25 @@ export function Settings() {
   const [testMsg, setTestMsg] = useState('');
   const [status, setStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
+  const defaultAiSource = useMemo(() => {
+    if (!aiSources.length) return null;
+    return aiSources.find((source) => source.id === defaultAiSourceId) || aiSources[0];
+  }, [aiSources, defaultAiSourceId]);
+
+  const activeAiSource = useMemo(() => {
+    if (!aiSources.length) return null;
+    return aiSources.find((source) => source.id === activeAiSourceId) || defaultAiSource || aiSources[0];
+  }, [aiSources, activeAiSourceId, defaultAiSource]);
+
   // Tools State
   const [ytdlpStatus, setYtdlpStatus] = useState<{ installed: boolean; version?: string; path?: string } | null>(null);
   const [isInstallingTool, setIsInstallingTool] = useState(false);
   const [installProgress, setInstallProgress] = useState(0);
+  const [mcpServers, setMcpServers] = useState<McpServerConfig[]>([]);
+  const [mcpStatusMessage, setMcpStatusMessage] = useState('');
+  const [isSyncingMcp, setIsSyncingMcp] = useState(false);
+  const [mcpTestingId, setMcpTestingId] = useState('');
+  const [mcpOauthState, setMcpOauthState] = useState<Record<string, { connected: boolean; tokenPath?: string }>>({});
 
   // Knowledge State
   const [vectorStats, setVectorStats] = useState<{ vectors: number; documents: number } | null>(null);
@@ -106,6 +282,161 @@ export function Settings() {
       window.ipcRenderer.off('youtube:install-progress', handleProgress);
     };
   }, [activeTab]);
+
+  useEffect(() => {
+    setTestStatus('idle');
+    setTestMsg('');
+    setDetectedAiProtocol((activeAiSource?.protocol || 'openai') as AiProtocol);
+  }, [activeAiSourceId, activeAiSource?.protocol]);
+
+  useEffect(() => {
+    if (!mcpStatusMessage) return;
+    const timer = window.setTimeout(() => setMcpStatusMessage(''), 2800);
+    return () => window.clearTimeout(timer);
+  }, [mcpStatusMessage]);
+
+  useEffect(() => {
+    if (activeTab !== 'tools') return;
+    for (const server of mcpServers) {
+      void handleRefreshMcpOAuth(server);
+    }
+  }, [activeTab, mcpServers]);
+
+  useEffect(() => {
+    if (!activeAiSource) return;
+    let cancelled = false;
+    const detect = async () => {
+      try {
+        const result = await window.ipcRenderer.detectAiProtocol({
+          baseURL: activeAiSource.baseURL,
+          presetId: activeAiSource.presetId,
+          protocol: activeAiSource.protocol,
+        });
+        if (cancelled || !result?.success || !result.protocol) return;
+        setDetectedAiProtocol(result.protocol);
+        if (activeAiSource.protocol !== result.protocol) {
+          updateAiSource(activeAiSource.id, (source) => ({ ...source, protocol: result.protocol }));
+        }
+      } catch {
+        // ignore detect failures for live typing
+      }
+    };
+    void detect();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeAiSource?.id, activeAiSource?.baseURL, activeAiSource?.presetId]);
+
+  const updateAiSource = (sourceId: string, updater: (source: AiSourceConfig) => AiSourceConfig) => {
+    setAiSources((prev) => prev.map((source) => (source.id === sourceId ? updater(source) : source)));
+  };
+
+  const handleAddAiSource = () => {
+    const nextSource = createAiSourceFromPreset(DEFAULT_AI_PRESET_ID);
+    setAiSources((prev) => [...prev, nextSource]);
+    setActiveAiSourceId(nextSource.id);
+    setDefaultAiSourceId((prev) => prev || nextSource.id);
+  };
+
+  const handleDeleteAiSource = (sourceId: string) => {
+    setAiSources((prev) => {
+      const next = prev.filter((source) => source.id !== sourceId);
+      if (!next.length) {
+        const fallback = createAiSourceFromPreset(DEFAULT_AI_PRESET_ID);
+        setActiveAiSourceId(fallback.id);
+        setDefaultAiSourceId(fallback.id);
+        return [fallback];
+      }
+      setDefaultAiSourceId((prevDefaultId) => (prevDefaultId === sourceId ? next[0].id : prevDefaultId));
+      setActiveAiSourceId((prevActiveId) => (prevActiveId === sourceId ? next[0].id : prevActiveId));
+      return next;
+    });
+  };
+
+  const persistMcpServers = async (nextServers: McpServerConfig[], tip?: string) => {
+    setIsSyncingMcp(true);
+    try {
+      const result = await window.ipcRenderer.mcp.save(nextServers);
+      if (!result?.success) {
+        setMcpStatusMessage(result?.error || 'MCP 配置保存失败');
+        return false;
+      }
+      setMcpServers((result.servers || nextServers) as McpServerConfig[]);
+      if (tip) setMcpStatusMessage(tip);
+      return true;
+    } catch (error) {
+      console.error('Failed to persist MCP servers:', error);
+      setMcpStatusMessage('MCP 配置保存失败');
+      return false;
+    } finally {
+      setIsSyncingMcp(false);
+    }
+  };
+
+  const handleAddMcpServer = async () => {
+    const next = [...mcpServers, createDefaultMcpServer()];
+    await persistMcpServers(next, '已新增 MCP Server，请完善配置后保存');
+  };
+
+  const handleDeleteMcpServer = async (serverId: string) => {
+    const next = mcpServers.filter((item) => item.id !== serverId);
+    await persistMcpServers(next, '已删除 MCP Server');
+  };
+
+  const handleUpdateMcpServer = (serverId: string, updater: (server: McpServerConfig) => McpServerConfig) => {
+    setMcpServers((prev) => prev.map((server) => (server.id === serverId ? updater(server) : server)));
+  };
+
+  const handleSaveMcpServers = async () => {
+    await persistMcpServers(mcpServers, 'MCP 配置已保存');
+  };
+
+  const handleDiscoverAndImportMcp = async () => {
+    setIsSyncingMcp(true);
+    try {
+      const result = await window.ipcRenderer.mcp.importLocal();
+      if (!result?.success) {
+        setMcpStatusMessage(result?.error || '导入本机 MCP 配置失败');
+        return;
+      }
+      setMcpServers((result.servers || []) as McpServerConfig[]);
+      setMcpStatusMessage(`已导入 ${result.imported || 0} 个 MCP Server（共 ${result.total || 0} 个）`);
+    } catch (error) {
+      console.error('Failed to import local MCP configs:', error);
+      setMcpStatusMessage('导入本机 MCP 配置失败');
+    } finally {
+      setIsSyncingMcp(false);
+    }
+  };
+
+  const handleTestMcpServer = async (server: McpServerConfig) => {
+    setMcpTestingId(server.id);
+    try {
+      const result = await window.ipcRenderer.mcp.test(server);
+      setMcpStatusMessage(`${server.name}：${result.message}`);
+    } catch (error) {
+      console.error('Failed to test MCP server:', error);
+      setMcpStatusMessage(`${server.name}：测试失败`);
+    } finally {
+      setMcpTestingId('');
+    }
+  };
+
+  const handleRefreshMcpOAuth = async (server: McpServerConfig) => {
+    try {
+      const result = await window.ipcRenderer.mcp.oauthStatus(server.id);
+      if (!result?.success) return;
+      setMcpOauthState((prev) => ({
+        ...prev,
+        [server.id]: {
+          connected: Boolean(result.connected),
+          tokenPath: result.tokenPath,
+        },
+      }));
+    } catch (error) {
+      console.error('Failed to query MCP oauth status:', error);
+    }
+  };
 
   const loadMemories = async () => {
     setIsMemoryLoading(true);
@@ -159,10 +490,39 @@ export function Settings() {
     try {
       const settings = await window.ipcRenderer.getSettings();
       if (settings) {
+        let sourceList = parseAiSources(settings.ai_sources_json);
+        if (!sourceList.length && (settings.api_endpoint || settings.api_key || settings.model_name)) {
+          const inferredPresetId = inferPresetIdByEndpoint(settings.api_endpoint || '');
+          sourceList = [{
+            id: generateAiSourceId(),
+            name: findAiPresetById(inferredPresetId)?.label || '默认 AI 源',
+            presetId: inferredPresetId,
+            baseURL: settings.api_endpoint || '',
+            apiKey: settings.api_key || '',
+            model: settings.model_name || '',
+            protocol: findAiPresetById(inferredPresetId)?.protocol || 'openai',
+          }];
+        }
+        if (!sourceList.length) {
+          sourceList = [createAiSourceFromPreset(DEFAULT_AI_PRESET_ID)];
+        }
+
+        const loadedDefaultId = settings.default_ai_source_id || sourceList[0]?.id || '';
+        const normalizedDefaultId = sourceList.some((source) => source.id === loadedDefaultId)
+          ? loadedDefaultId
+          : sourceList[0].id;
+        const resolvedDefaultSource = sourceList.find((source) => source.id === normalizedDefaultId) || sourceList[0];
+
+        setAiSources(sourceList);
+        setDefaultAiSourceId(normalizedDefaultId);
+        setActiveAiSourceId(normalizedDefaultId);
+        setDetectedAiProtocol((resolvedDefaultSource?.protocol || findAiPresetById(resolvedDefaultSource?.presetId || '')?.protocol || 'openai') as AiProtocol);
+        setMcpServers(parseMcpServers(settings.mcp_servers_json));
+
         setFormData({
-          api_endpoint: settings.api_endpoint || '',
-          api_key: settings.api_key || '',
-          model_name: settings.model_name || '',
+          api_endpoint: resolvedDefaultSource?.baseURL || settings.api_endpoint || '',
+          api_key: resolvedDefaultSource?.apiKey || settings.api_key || '',
+          model_name: resolvedDefaultSource?.model || settings.model_name || '',
           workspace_dir: settings.workspace_dir || '',
           transcription_model: settings.transcription_model || '',
           transcription_endpoint: settings.transcription_endpoint || '',
@@ -176,7 +536,15 @@ export function Settings() {
           image_model: settings.image_model || 'gpt-image-1',
           image_size: settings.image_size || '1024x1024',
           image_quality: settings.image_quality || 'standard',
+          redclaw_compact_target_tokens: String(settings.redclaw_compact_target_tokens || 256000),
         });
+      } else {
+        const fallback = createAiSourceFromPreset(DEFAULT_AI_PRESET_ID);
+        setAiSources([fallback]);
+        setDefaultAiSourceId(fallback.id);
+        setActiveAiSourceId(fallback.id);
+        setDetectedAiProtocol('openai');
+        setMcpServers([]);
       }
     } catch (e) {
       console.error("Failed to load settings", e);
@@ -254,9 +622,10 @@ export function Settings() {
   };
 
   const handleTestConnection = async () => {
-    if (!formData.api_endpoint || !formData.api_key) {
+    const source = activeAiSource || defaultAiSource;
+    if (!source?.baseURL || !source?.apiKey) {
       setTestStatus('error');
-      setTestMsg('Endpoint and Key are required');
+      setTestMsg('请先填写当前 AI 源的 Endpoint 与 API Key');
       return;
     }
 
@@ -265,14 +634,33 @@ export function Settings() {
     setTestMsg('');
 
     try {
-      const models = await window.ipcRenderer.fetchModels({
-        apiKey: formData.api_key,
-        baseURL: formData.api_endpoint
+      const detectResult = await window.ipcRenderer.detectAiProtocol({
+        baseURL: source.baseURL,
+        presetId: source.presetId,
+        protocol: source.protocol,
       });
 
-      setAvailableModels(models);
+      const protocol = detectResult?.protocol || source.protocol || 'openai';
+      setDetectedAiProtocol(protocol);
+      updateAiSource(source.id, (prev) => ({ ...prev, protocol }));
+
+      const testResult = await window.ipcRenderer.testAiConnection({
+        apiKey: source.apiKey,
+        baseURL: source.baseURL,
+        presetId: source.presetId,
+        protocol,
+      });
+
+      if (!testResult.success) {
+        setAvailableModels([]);
+        setTestStatus('error');
+        setTestMsg(testResult.message || 'Connection failed');
+        return;
+      }
+
+      setAvailableModels(testResult.models || []);
       setTestStatus('success');
-      setTestMsg(`Connected! Found ${models.length} models.`);
+      setTestMsg(testResult.message || `Connected! Found ${testResult.models?.length || 0} models.`);
     } catch (e: unknown) {
       setTestStatus('error');
       const message = e instanceof Error ? e.message : 'Connection failed';
@@ -286,7 +674,31 @@ export function Settings() {
     e.preventDefault();
     setStatus('saving');
     try {
-      await window.ipcRenderer.saveSettings(formData);
+      const sanitizedSources = aiSources.map((source) => ({
+        ...source,
+        name: source.name.trim(),
+        presetId: source.presetId.trim() || 'custom',
+        baseURL: source.baseURL.trim(),
+        apiKey: source.apiKey.trim(),
+        model: source.model.trim(),
+        protocol: source.protocol || findAiPresetById(source.presetId)?.protocol || 'openai',
+      }));
+      const defaultSource = sanitizedSources.find((source) => source.id === defaultAiSourceId) || sanitizedSources[0];
+      const parsedCompactTokens = Number(formData.redclaw_compact_target_tokens);
+      const compactTargetTokens = Number.isFinite(parsedCompactTokens) && parsedCompactTokens > 0
+        ? Math.max(16000, Math.floor(parsedCompactTokens))
+        : 256000;
+
+      await window.ipcRenderer.saveSettings({
+        ...formData,
+        api_endpoint: defaultSource?.baseURL || '',
+        api_key: defaultSource?.apiKey || '',
+        model_name: defaultSource?.model || '',
+        ai_sources_json: JSON.stringify(sanitizedSources),
+        default_ai_source_id: defaultSource?.id || '',
+        mcp_servers_json: JSON.stringify(mcpServers),
+        redclaw_compact_target_tokens: compactTargetTokens,
+      });
       setStatus('saved');
       setTimeout(() => setStatus('idle'), 2000);
     } catch (e) {
@@ -394,48 +806,225 @@ export function Settings() {
                 <section className="space-y-6">
                   <h2 className="text-lg font-medium text-text-primary mb-6">AI 模型设置</h2>
 
-                  <div className="group">
-                    <label className="block text-xs font-medium text-text-secondary mb-1.5">
-                      API Endpoint (Base URL)
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.api_endpoint}
-                      onChange={e => setFormData(d => ({ ...d, api_endpoint: e.target.value }))}
-                      placeholder="https://api.openai.com/v1"
-                      className="w-full bg-transparent border-b border-border py-2 text-sm text-text-primary focus:outline-none focus:border-accent-primary transition-colors placeholder:text-text-tertiary"
-                    />
-                  </div>
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <h3 className="text-sm font-medium text-text-primary">聊天 AI 源</h3>
+                        <p className="text-[11px] text-text-tertiary mt-1">
+                          参考 AionUi 的多平台配置方式，可同时保存多个 AI 源，并指定默认源供全局聊天/Agent 使用。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleAddAiSource}
+                        className="flex items-center gap-1.5 px-3 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors"
+                      >
+                        <Plus className="w-3 h-3" />
+                        新增 AI 源
+                      </button>
+                    </div>
 
-                  <div className="group">
-                    <label className="block text-xs font-medium text-text-secondary mb-1.5">
-                      API Key
-                    </label>
-                    <PasswordInput
-                      value={formData.api_key}
-                      onChange={e => setFormData(d => ({ ...d, api_key: e.target.value }))}
-                      placeholder="sk-..."
-                      className="w-full bg-transparent border-b border-border py-2 text-sm text-text-primary focus:outline-none focus:border-accent-primary transition-colors placeholder:text-text-tertiary"
-                    />
-                  </div>
+                    <div className="space-y-2">
+                      {aiSources.map((source) => {
+                        const preset = findAiPresetById(source.presetId);
+                        const isDefault = source.id === defaultAiSourceId;
+                        const isActive = source.id === (activeAiSource?.id || '');
+                        return (
+                          <div
+                            key={source.id}
+                            onClick={() => setActiveAiSourceId(source.id)}
+                            className={clsx(
+                              "w-full text-left rounded-lg border p-3 transition-colors cursor-pointer",
+                              isActive ? "border-accent-primary bg-surface-secondary/40" : "border-border bg-surface-secondary/20 hover:bg-surface-secondary/30"
+                            )}
+                          >
+                            <div className="flex items-start justify-between gap-3">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm font-medium text-text-primary truncate">{source.name || '未命名 AI 源'}</span>
+                                  {isDefault && (
+                                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-amber-500/10 text-amber-600">
+                                      <Star className="w-2.5 h-2.5" />
+                                      默认
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-[11px] text-text-tertiary mt-1 truncate">
+                                  {preset?.label || 'Custom'} · {source.model || '(未设置模型)'}
+                                </p>
+                                <p className="text-[10px] text-text-tertiary mt-1 truncate">
+                                  {source.baseURL || '(未设置 Endpoint)'}
+                                </p>
+                              </div>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleDeleteAiSource(source.id);
+                                }}
+                                className="p-1 text-text-tertiary hover:text-red-500 hover:bg-red-500/10 rounded transition-colors"
+                                title="删除 AI 源"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
 
-                  <div className="group">
-                    <label className="block text-xs font-medium text-text-secondary mb-1.5">
-                      模型名称
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.model_name}
-                      onChange={e => setFormData(d => ({ ...d, model_name: e.target.value }))}
-                      list="model-list"
-                      placeholder="e.g. gpt-4o, claude-3-5-sonnet"
-                      className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
-                    />
-                    <datalist id="model-list">
-                      {availableModels.map(m => (
-                        <option key={m.id} value={m.id} />
-                      ))}
-                    </datalist>
+                    {activeAiSource && (
+                      <div className="bg-surface-secondary/20 border border-border rounded-lg p-4 space-y-4">
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                          <div className="group">
+                            <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                              来源名称
+                            </label>
+                            <input
+                              type="text"
+                              value={activeAiSource.name}
+                              onChange={(e) => updateAiSource(activeAiSource.id, (source) => ({ ...source, name: e.target.value }))}
+                              placeholder="例如：OpenAI 主账号"
+                              className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                            />
+                          </div>
+                          <div className="group">
+                            <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                              平台预设
+                            </label>
+                            <select
+                              value={activeAiSource.presetId}
+                              onChange={(e) => {
+                                const nextPresetId = e.target.value;
+                                updateAiSource(activeAiSource.id, (source) => {
+                                  const previousPreset = findAiPresetById(source.presetId);
+                                  const nextPreset = findAiPresetById(nextPresetId);
+                                  const shouldSyncBaseURL = !source.baseURL || (previousPreset?.baseURL && source.baseURL === previousPreset.baseURL);
+                                  const shouldSyncName = !source.name || source.name === previousPreset?.label;
+                                  return {
+                                    ...source,
+                                    presetId: nextPresetId,
+                                    baseURL: shouldSyncBaseURL ? (nextPreset?.baseURL || '') : source.baseURL,
+                                    name: shouldSyncName ? (nextPreset?.label || source.name) : source.name,
+                                    protocol: nextPreset?.protocol || source.protocol || 'openai',
+                                  };
+                                });
+                              }}
+                              className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                            >
+                              {AI_SOURCE_PRESETS.map((preset) => (
+                                <option key={preset.id} value={preset.id}>
+                                  {preset.label}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="group">
+                            <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                              协议
+                            </label>
+                            <select
+                              value={activeAiSource.protocol || 'openai'}
+                              onChange={(e) => {
+                                const protocol = (e.target.value as AiProtocol);
+                                updateAiSource(activeAiSource.id, (source) => ({ ...source, protocol }));
+                                setDetectedAiProtocol(protocol);
+                              }}
+                              className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                            >
+                              <option value="openai">OpenAI Compatible</option>
+                              <option value="anthropic">Anthropic Native</option>
+                              <option value="gemini">Gemini Native</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        <div className="group">
+                          <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                            API Endpoint (Base URL)
+                          </label>
+                          <input
+                            type="text"
+                            value={activeAiSource.baseURL}
+                            onChange={(e) => updateAiSource(activeAiSource.id, (source) => ({ ...source, baseURL: e.target.value }))}
+                            placeholder="https://api.openai.com/v1"
+                            className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                          />
+                        </div>
+
+                        <div className="group">
+                          <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                            API Key
+                          </label>
+                          <PasswordInput
+                            value={activeAiSource.apiKey}
+                            onChange={(e) => updateAiSource(activeAiSource.id, (source) => ({ ...source, apiKey: e.target.value }))}
+                            placeholder="sk-..."
+                            className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                          />
+                        </div>
+
+                        <div className="group">
+                          <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                            模型名称
+                          </label>
+                          <input
+                            type="text"
+                            value={activeAiSource.model}
+                            onChange={(e) => updateAiSource(activeAiSource.id, (source) => ({ ...source, model: e.target.value }))}
+                            list="model-list"
+                            placeholder="e.g. gpt-4o, claude-3-5-sonnet"
+                            className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                          />
+                          <datalist id="model-list">
+                            {availableModels.map((m) => (
+                              <option key={m.id} value={m.id} />
+                            ))}
+                          </datalist>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-4">
+                          <label className="inline-flex items-center gap-2 text-xs text-text-secondary cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={activeAiSource.id === defaultAiSourceId}
+                              onChange={(e) => {
+                                if (e.target.checked) setDefaultAiSourceId(activeAiSource.id);
+                              }}
+                            />
+                            设为默认聊天源
+                          </label>
+
+                          <div className="flex items-center space-x-4">
+                            <button
+                              type="button"
+                              onClick={handleTestConnection}
+                              disabled={isTesting}
+                              className="flex items-center px-3 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors disabled:opacity-50"
+                            >
+                              {isTesting ? <RefreshCw className="w-3 h-3 mr-2 animate-spin" /> : <RefreshCw className="w-3 h-3 mr-2" />}
+                              测试连接
+                            </button>
+                            <span className="text-[11px] text-text-tertiary">
+                              当前协议: <span className="font-mono">{detectedAiProtocol}</span>
+                            </span>
+
+                            {testStatus === 'success' && (
+                              <span className="flex items-center text-xs text-status-success">
+                                <CheckCircle2 className="w-3 h-3 mr-1.5" />
+                                {testMsg}
+                              </span>
+                            )}
+                            {testStatus === 'error' && (
+                              <span className="flex items-center text-xs text-status-error">
+                                <AlertCircle className="w-3 h-3 mr-1.5" />
+                                {testMsg}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   <div className="group">
@@ -619,30 +1208,28 @@ export function Settings() {
                     </div>
                   </div>
 
-                  <div className="flex items-center space-x-4">
-                    <button
-                      type="button"
-                      onClick={handleTestConnection}
-                      disabled={isTesting}
-                      className="flex items-center px-3 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors disabled:opacity-50"
-                    >
-                      {isTesting ? <RefreshCw className="w-3 h-3 mr-2 animate-spin" /> : <RefreshCw className="w-3 h-3 mr-2" />}
-                      测试连接
-                    </button>
-
-                    {testStatus === 'success' && (
-                      <span className="flex items-center text-xs text-status-success">
-                        <CheckCircle2 className="w-3 h-3 mr-1.5" />
-                        {testMsg}
-                      </span>
-                    )}
-                    {testStatus === 'error' && (
-                      <span className="flex items-center text-xs text-status-error">
-                        <AlertCircle className="w-3 h-3 mr-1.5" />
-                        {testMsg}
-                      </span>
-                    )}
+                  <div className="pt-4 border-t border-border">
+                    <h3 className="text-sm font-medium text-text-primary mb-4">RedClaw 上下文压缩策略</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div className="group">
+                        <label className="block text-xs font-medium text-text-secondary mb-1.5">
+                          自动压缩阈值（tokens）
+                        </label>
+                        <input
+                          type="number"
+                          min={16000}
+                          step={1000}
+                          value={formData.redclaw_compact_target_tokens}
+                          onChange={e => setFormData(d => ({ ...d, redclaw_compact_target_tokens: e.target.value }))}
+                          className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                        />
+                        <p className="mt-1 text-[11px] text-text-tertiary">
+                          默认 256000。RedClaw 对话预计上下文超过该值时会自动 compact。
+                        </p>
+                      </div>
+                    </div>
                   </div>
+
                 </section>
               </div>
             )}
@@ -776,6 +1363,180 @@ export function Settings() {
             {activeTab === 'tools' && (
               <section className="space-y-6">
                 <h2 className="text-lg font-medium text-text-primary mb-6">外部工具管理</h2>
+
+                <div className="bg-surface-secondary/30 rounded-lg border border-border p-4 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-medium text-text-primary">MCP 数据源中台</h3>
+                      <p className="text-xs text-text-tertiary mt-1">
+                        管理 MCP Server，并支持从本机常见客户端一键导入配置。
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDiscoverAndImportMcp}
+                        disabled={isSyncingMcp}
+                        className="px-3 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors disabled:opacity-50"
+                      >
+                        {isSyncingMcp ? '导入中...' : '一键导入本机配置'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleAddMcpServer}
+                        disabled={isSyncingMcp}
+                        className="px-3 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors disabled:opacity-50"
+                      >
+                        新增 Server
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleSaveMcpServers}
+                        disabled={isSyncingMcp}
+                        className="px-3 py-1.5 bg-accent-primary text-white rounded text-xs hover:opacity-90 disabled:opacity-50"
+                      >
+                        保存 MCP
+                      </button>
+                    </div>
+                  </div>
+
+                  {mcpStatusMessage && (
+                    <div className="text-xs text-text-secondary border border-border rounded px-3 py-2 bg-surface-primary/60">
+                      {mcpStatusMessage}
+                    </div>
+                  )}
+
+                  {mcpServers.length === 0 ? (
+                    <div className="text-xs text-text-tertiary border border-dashed border-border rounded-lg px-3 py-5 text-center">
+                      暂无 MCP Server。你可以新增一条，或使用“一键导入本机配置”。
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {mcpServers.map((server) => (
+                        <div key={server.id} className="border border-border rounded-lg p-3 bg-surface-primary/40 space-y-3">
+                          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                            <div className="md:col-span-2">
+                              <label className="block text-[11px] text-text-tertiary mb-1">名称</label>
+                              <input
+                                type="text"
+                                value={server.name}
+                                onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({ ...item, name: e.target.value }))}
+                                className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                              />
+                              <div className="mt-1 text-[11px] text-text-tertiary font-mono">id: {server.id}</div>
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-text-tertiary mb-1">传输协议</label>
+                              <select
+                                value={server.transport}
+                                onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({ ...item, transport: e.target.value as McpServerConfig['transport'] }))}
+                                className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                              >
+                                <option value="stdio">stdio</option>
+                                <option value="streamable-http">streamable-http</option>
+                                <option value="sse">sse</option>
+                              </select>
+                            </div>
+                            <div className="flex items-end justify-between gap-2">
+                              <label className="inline-flex items-center gap-2 text-xs text-text-secondary">
+                                <input
+                                  type="checkbox"
+                                  checked={server.enabled}
+                                  onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({ ...item, enabled: e.target.checked }))}
+                                />
+                                启用
+                              </label>
+                              <button
+                                type="button"
+                                onClick={() => void handleDeleteMcpServer(server.id)}
+                                className="px-2.5 py-1.5 border border-red-300 text-red-600 rounded text-xs hover:bg-red-50/70 transition-colors"
+                              >
+                                删除
+                              </button>
+                            </div>
+                          </div>
+
+                          {server.transport === 'stdio' ? (
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                              <div>
+                                <label className="block text-[11px] text-text-tertiary mb-1">Command</label>
+                                <input
+                                  type="text"
+                                  value={server.command || ''}
+                                  onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({ ...item, command: e.target.value }))}
+                                  placeholder="npx"
+                                  className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-text-tertiary mb-1">Args（空格分隔）</label>
+                                <input
+                                  type="text"
+                                  value={(server.args || []).join(' ')}
+                                  onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({
+                                    ...item,
+                                    args: e.target.value.split(' ').map((arg) => arg.trim()).filter(Boolean),
+                                  }))}
+                                  placeholder="-y @modelcontextprotocol/server-filesystem /path"
+                                  className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-[11px] text-text-tertiary mb-1">Env（每行 KEY=VALUE）</label>
+                                <textarea
+                                  value={stringifyEnvRecord(server.env)}
+                                  onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({
+                                    ...item,
+                                    env: parseEnvText(e.target.value),
+                                  }))}
+                                  rows={3}
+                                  className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-xs focus:outline-none focus:border-accent-primary transition-colors"
+                                />
+                              </div>
+                            </div>
+                          ) : (
+                            <div>
+                              <label className="block text-[11px] text-text-tertiary mb-1">URL</label>
+                              <input
+                                type="text"
+                                value={server.url || ''}
+                                onChange={(e) => handleUpdateMcpServer(server.id, (item) => ({ ...item, url: e.target.value }))}
+                                placeholder="https://your-mcp-host/sse"
+                                className="w-full bg-surface-secondary/30 rounded border border-border px-3 py-2 text-sm focus:outline-none focus:border-accent-primary transition-colors"
+                              />
+                            </div>
+                          )}
+
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="text-[11px] text-text-tertiary">
+                              OAuth: {mcpOauthState[server.id]?.connected ? '已连接' : '未连接'}
+                              {mcpOauthState[server.id]?.tokenPath ? (
+                                <span className="ml-1 font-mono">{mcpOauthState[server.id]?.tokenPath}</span>
+                              ) : null}
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => void handleRefreshMcpOAuth(server)}
+                                className="px-2.5 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors"
+                              >
+                                刷新 OAuth
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => void handleTestMcpServer(server)}
+                                disabled={mcpTestingId === server.id}
+                                className="px-2.5 py-1.5 border border-border rounded text-xs hover:bg-surface-secondary transition-colors disabled:opacity-50"
+                              >
+                                {mcpTestingId === server.id ? '测试中...' : '测试连接'}
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
                 <div className="bg-surface-secondary/30 rounded-lg border border-border p-4">
                   <div className="flex items-start justify-between">

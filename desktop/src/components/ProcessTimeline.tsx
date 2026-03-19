@@ -1,5 +1,5 @@
-import React from 'react';
-import { Loader2 } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { CheckCircle2, ChevronDown, ChevronRight, Copy, Check, Loader2, Wrench, XCircle } from 'lucide-react';
 
 // --- Types ---
 
@@ -12,6 +12,7 @@ export interface ProcessItem {
   content: string;
   status: 'running' | 'done' | 'failed';
   toolData?: {
+    callId?: string;
     name: string;
     input: unknown;
     output?: string;
@@ -31,7 +32,11 @@ const getStatusText = (items: ProcessItem[]): string => {
   const runningItem = [...items].reverse().find(item => item.status === 'running');
 
   if (!runningItem) {
-    return '正在思考...';
+    const failedCount = items.filter(item => item.status === 'failed').length;
+    if (failedCount > 0) {
+      return `处理完成（${failedCount} 个步骤失败）`;
+    }
+    return `处理完成（${items.length} 个步骤）`;
   }
 
   if (runningItem.type === 'thought') {
@@ -60,6 +65,114 @@ const getStatusText = (items: ProcessItem[]): string => {
   return '正在处理...';
 };
 
+const getToolDisplayLabel = (name: string): string => {
+  const labelMap: Record<string, string> = {
+    save_memory: '写入记忆',
+    read_file: '读取文件',
+    write_file: '写入文件',
+    edit_file: '编辑文件',
+    list_dir: '列出目录',
+    grep: '内容搜索',
+    app_cli: '应用命令',
+    bash: '终端执行',
+    run_command: '终端执行',
+    web_search: '联网搜索',
+    duckduckgo_search: '联网搜索',
+    calculator: '计算器',
+    explore_workspace: '工作区浏览',
+  };
+  return labelMap[name] || name;
+};
+
+const stringifyValue = (value: unknown): string => {
+  if (value === undefined) return '';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+};
+
+const toObjectIfJsonLike = (value: unknown): Record<string, unknown> | null => {
+  if (!value) return null;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+};
+
+const getToolSummary = (toolName: string, input: unknown): string => {
+  const inputObject = toObjectIfJsonLike(input);
+  if (!inputObject) return '';
+
+  const pickText = (...keys: string[]): string => {
+    for (const key of keys) {
+      const value = inputObject[key];
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+  };
+
+  if (toolName === 'app_cli') {
+    return pickText('command');
+  }
+  if (toolName === 'bash' || toolName === 'run_command') {
+    return pickText('cmd', 'command');
+  }
+  if (toolName === 'read_file') {
+    return pickText('filePath', 'path');
+  }
+  if (toolName === 'write_file' || toolName === 'edit_file') {
+    return pickText('filePath', 'path');
+  }
+  if (toolName === 'list_dir') {
+    return pickText('path');
+  }
+  if (toolName === 'explore_workspace') {
+    return pickText('target');
+  }
+  if (toolName === 'web_search' || toolName === 'duckduckgo_search') {
+    return pickText('query', 'q');
+  }
+  return '';
+};
+
+const truncateText = (text: string, maxLength = 1800): string => {
+  if (text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength)}\n... (已截断)`;
+};
+
+const formatDuration = (duration?: number): string => {
+  if (!duration || duration <= 0) return '';
+  if (duration < 1000) return `${duration}ms`;
+  if (duration < 60_000) return `${(duration / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(duration / 60_000);
+  const seconds = Math.round((duration % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+};
+
+const formatTime = (timestamp: number): string => {
+  if (!timestamp) return '';
+  const date = new Date(timestamp);
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+};
+
 // --- Main Component ---
 
 interface ProcessTimelineProps {
@@ -67,24 +180,325 @@ interface ProcessTimelineProps {
   isStreaming?: boolean;
 }
 
+type TimelineFilter = 'all' | 'running' | 'failed' | 'done' | 'tool';
+
+const FILTER_LABELS: Record<TimelineFilter, string> = {
+  all: '全部',
+  running: '运行中',
+  failed: '失败',
+  done: '已完成',
+  tool: '仅工具',
+};
+
 export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
-  // Don't show anything if no items or not streaming
   if (!items || items.length === 0) return null;
 
-  // Check if any item is still running
   const hasRunningItem = items.some(item => item.status === 'running');
-
-  // Only show indicator while actively processing
-  if (!isStreaming && !hasRunningItem) {
-    return null; // Hide completely when done
-  }
-
   const statusText = getStatusText(items);
+  const [expanded, setExpanded] = useState(true);
+  const [filter, setFilter] = useState<TimelineFilter>('all');
+  const [search, setSearch] = useState('');
+  const [expandAllOutputs, setExpandAllOutputs] = useState(false);
+  const [copiedDiagnosticId, setCopiedDiagnosticId] = useState<string | null>(null);
+  const runningCount = items.filter(item => item.status === 'running').length;
+  const failedCount = items.filter(item => item.status === 'failed').length;
+  const doneCount = items.filter(item => item.status === 'done').length;
+  const normalizedSearch = search.trim().toLowerCase();
+  const filteredItems = items.filter(item => {
+    if (filter === 'running' && item.status !== 'running') return false;
+    if (filter === 'failed' && item.status !== 'failed') return false;
+    if (filter === 'done' && item.status !== 'done') return false;
+    if (filter === 'tool' && item.type !== 'tool-call') return false;
+
+    if (!normalizedSearch) return true;
+
+    const isTool = item.type === 'tool-call';
+    const toolName = isTool ? item.toolData?.name || '' : '';
+    const toolSummary = isTool ? getToolSummary(toolName, item.toolData?.input) : '';
+    const haystack = [
+      item.title || '',
+      item.content || '',
+      item.status || '',
+      toolName,
+      toolSummary,
+      item.toolData?.callId || '',
+      stringifyValue(item.toolData?.input),
+      item.toolData?.output || '',
+    ].join('\n').toLowerCase();
+    return haystack.includes(normalizedSearch);
+  });
+  const failedToolItems = filteredItems.filter(item => item.type === 'tool-call' && item.status === 'failed');
+
+  const copyText = async (text: string): Promise<boolean> => {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return ok;
+      } catch {
+        return false;
+      }
+    }
+  };
+
+  const buildToolDiagnostic = (item: ProcessItem): string => {
+    const toolName = item.toolData?.name || 'unknown_tool';
+    const label = getToolDisplayLabel(toolName);
+    const lines = [
+      '# RedClaw Tool Diagnostic',
+      `status: ${item.status}`,
+      `time: ${formatTime(item.timestamp)}`,
+      `duration: ${formatDuration(item.duration) || 'n/a'}`,
+      `tool: ${label} (${toolName})`,
+      `callId: ${item.toolData?.callId || 'n/a'}`,
+      '',
+      '## description',
+      item.content || '(empty)',
+      '',
+      '## input',
+      stringifyValue(item.toolData?.input) || '(empty)',
+      '',
+      '## output',
+      item.toolData?.output || '(empty)',
+    ];
+    return lines.join('\n');
+  };
+
+  const handleCopyDiagnostic = async (item: ProcessItem) => {
+    const ok = await copyText(buildToolDiagnostic(item));
+    if (!ok) return;
+    setCopiedDiagnosticId(item.id);
+    setTimeout(() => {
+      setCopiedDiagnosticId(current => (current === item.id ? null : current));
+    }, 1500);
+  };
+
+  useEffect(() => {
+    if (hasRunningItem) {
+      setExpanded(true);
+    }
+  }, [hasRunningItem]);
 
   return (
-    <div className="flex items-center gap-2 py-2 px-1 text-sm text-text-tertiary animate-in fade-in duration-200">
-      <Loader2 className="w-3.5 h-3.5 animate-spin text-accent-primary" />
-      <span>{statusText}</span>
+    <div className="my-2 w-full max-w-3xl rounded-xl border border-border bg-surface-secondary/40 overflow-hidden animate-in fade-in duration-200">
+      <div className="px-3 py-2 border-b border-border/70 flex items-center justify-between gap-3">
+        <div className="min-w-0 flex items-center gap-2 text-sm text-text-secondary">
+          {hasRunningItem || isStreaming ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-accent-primary shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-3.5 h-3.5 text-green-500 shrink-0" />
+          )}
+          <span className="truncate">{statusText}</span>
+        </div>
+        <div className="shrink-0 flex items-center gap-2">
+          {runningCount > 0 && (
+            <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-500">
+              {runningCount} 运行中
+            </span>
+          )}
+          {doneCount > 0 && (
+            <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-green-500/10 text-green-500">
+              {doneCount} 完成
+            </span>
+          )}
+          {failedCount > 0 && (
+            <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-red-500/10 text-red-500">
+              {failedCount} 失败
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => setExpanded(prev => !prev)}
+            className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-text-primary transition-colors"
+          >
+            {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+            <span>{expanded ? '收起过程' : `查看过程 (${items.length})`}</span>
+          </button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="p-3 space-y-2">
+          <div className="rounded-lg border border-border/70 bg-surface-primary/60 p-2 flex items-center gap-2 flex-wrap">
+            {(Object.keys(FILTER_LABELS) as TimelineFilter[]).map(key => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setFilter(key)}
+                className={
+                  `text-xs px-2 py-1 rounded-md transition-colors border ` +
+                  (filter === key
+                    ? 'bg-accent-primary/15 text-accent-primary border-accent-primary/40'
+                    : 'bg-surface-secondary text-text-tertiary border-border hover:text-text-primary')
+                }
+              >
+                {FILTER_LABELS[key]}
+              </button>
+            ))}
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="搜索命令、路径、callId、输出..."
+              className="h-7 min-w-[220px] flex-1 rounded-md border border-border bg-surface-secondary px-2 text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent-primary/40"
+            />
+            <button
+              type="button"
+              onClick={() => setExpandAllOutputs(v => !v)}
+              className={
+                `text-xs px-2 py-1 rounded-md border transition-colors ` +
+                (expandAllOutputs
+                  ? 'bg-accent-primary/15 text-accent-primary border-accent-primary/40'
+                  : 'bg-surface-secondary text-text-tertiary border-border hover:text-text-primary')
+              }
+            >
+              {expandAllOutputs ? '恢复自动展开' : '展开全部输出'}
+            </button>
+            {failedToolItems.length > 0 && (
+              <span className="text-[11px] px-2 py-1 rounded-md border border-red-500/30 bg-red-500/10 text-red-500">
+                当前筛选命中 {failedToolItems.length} 个失败工具
+              </span>
+            )}
+            <span className="text-[11px] text-text-tertiary px-1">
+              {filteredItems.length}/{items.length}
+            </span>
+          </div>
+
+          {filteredItems.map(item => {
+            const inputText = item.type === 'tool-call' ? truncateText(stringifyValue(item.toolData?.input)) : '';
+            const outputText = item.type === 'tool-call' ? truncateText(item.toolData?.output || '') : '';
+            const durationText = formatDuration(item.duration);
+            const isTool = item.type === 'tool-call';
+            const title =
+              item.title ||
+              (isTool ? item.toolData?.name || 'tool_call' : item.type === 'thought' ? '思考' : item.type === 'skill' ? '技能' : '阶段');
+            const subtitle = item.content?.trim();
+            const toolName = isTool ? (item.toolData?.name || title) : '';
+            const toolDisplayLabel = isTool ? getToolDisplayLabel(toolName) : '';
+            const toolCallId = isTool ? item.toolData?.callId : undefined;
+            const toolSummary = isTool ? getToolSummary(toolName, item.toolData?.input) : '';
+            const timeText = formatTime(item.timestamp);
+
+            return (
+              <div key={item.id} className="rounded-lg border border-border/80 bg-surface-primary/70 overflow-hidden">
+                <div className="px-3 py-2 flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      {isTool ? (
+                        <Wrench className="w-3.5 h-3.5 text-accent-primary shrink-0" />
+                      ) : (
+                        <div className="w-3.5 h-3.5 rounded-full bg-text-tertiary/60 shrink-0" />
+                      )}
+                      <span className="text-xs font-mono text-text-primary truncate">
+                        {isTool ? `${toolDisplayLabel} (${toolName})` : title}
+                      </span>
+                    </div>
+                    {subtitle && (
+                      <div className="mt-1 text-xs text-text-tertiary whitespace-pre-wrap break-words">
+                        {subtitle}
+                      </div>
+                    )}
+                    {toolSummary && (
+                      <div className="mt-1 text-xs font-mono text-accent-primary/90 truncate">
+                        {toolSummary}
+                      </div>
+                    )}
+                    {toolCallId && (
+                      <div className="mt-1 text-[11px] font-mono text-text-tertiary/90 truncate">
+                        callId: {toolCallId}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="shrink-0 flex items-center gap-2">
+                    {timeText && (
+                      <span className="text-[11px] text-text-tertiary">{timeText}</span>
+                    )}
+                    {durationText && (
+                      <span className="text-[11px] text-text-tertiary">{durationText}</span>
+                    )}
+                    {item.status === 'running' && (
+                      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-500">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        运行中
+                      </span>
+                    )}
+                    {item.status === 'done' && (
+                      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-green-500/10 text-green-500">
+                        <CheckCircle2 className="w-3 h-3" />
+                        完成
+                      </span>
+                    )}
+                    {item.status === 'failed' && (
+                      <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-red-500/10 text-red-500">
+                        <XCircle className="w-3 h-3" />
+                        失败
+                      </span>
+                    )}
+                    {isTool && item.status === 'failed' && (
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyDiagnostic(item)}
+                        className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border border-border bg-surface-secondary text-text-tertiary hover:text-text-primary transition-colors"
+                      >
+                        {copiedDiagnosticId === item.id ? (
+                          <>
+                            <Check className="w-3 h-3 text-green-500" />
+                            <span className="text-green-500">已复制</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3 h-3" />
+                            <span>复制诊断</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {isTool && (inputText || outputText) && (
+                  <details className="border-t border-border/70 px-3 py-2" open={expandAllOutputs || item.status === 'running' || item.status === 'failed'}>
+                    <summary className="text-xs text-text-tertiary cursor-pointer select-none">
+                      查看参数与输出
+                    </summary>
+                    {inputText && (
+                      <div className="mt-2">
+                        <div className="text-[11px] text-text-tertiary mb-1">输入参数</div>
+                        <pre className="text-xs font-mono bg-surface-secondary rounded p-2 whitespace-pre-wrap break-words max-h-36 overflow-auto">
+                          {inputText}
+                        </pre>
+                      </div>
+                    )}
+                    {outputText && (
+                      <div className="mt-2">
+                        <div className="text-[11px] text-text-tertiary mb-1">工具输出</div>
+                        <pre className="text-xs font-mono bg-surface-secondary rounded p-2 whitespace-pre-wrap break-words max-h-44 overflow-auto">
+                          {outputText}
+                        </pre>
+                      </div>
+                    )}
+                  </details>
+                )}
+              </div>
+            );
+          })}
+          {filteredItems.length === 0 && (
+            <div className="rounded-lg border border-border/70 bg-surface-primary/60 px-3 py-4 text-center text-xs text-text-tertiary">
+              当前筛选条件下没有匹配的步骤。
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

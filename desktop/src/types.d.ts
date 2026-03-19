@@ -28,10 +28,12 @@ declare global {
 
   interface Window {
     ipcRenderer: {
-      saveSettings: (settings: { api_endpoint: string; api_key: string; model_name: string; workspace_dir?: string; active_space_id?: string; role_mapping?: Record<string, string> | string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; image_size?: string; image_quality?: string }) => Promise<unknown>;
-      getSettings: () => Promise<{ api_endpoint: string; api_key: string; model_name: string; workspace_dir?: string; active_space_id?: string; role_mapping?: string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; image_size?: string; image_quality?: string } | undefined>;
+      saveSettings: (settings: { api_endpoint: string; api_key: string; model_name: string; workspace_dir?: string; active_space_id?: string; role_mapping?: Record<string, string> | string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; ai_sources_json?: string; default_ai_source_id?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; image_size?: string; image_quality?: string; mcp_servers_json?: string; redclaw_compact_target_tokens?: number }) => Promise<unknown>;
+      getSettings: () => Promise<{ api_endpoint: string; api_key: string; model_name: string; workspace_dir?: string; active_space_id?: string; role_mapping?: string; transcription_model?: string; transcription_endpoint?: string; transcription_key?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string; ai_sources_json?: string; default_ai_source_id?: string; image_provider?: string; image_endpoint?: string; image_api_key?: string; image_model?: string; image_size?: string; image_quality?: string; mcp_servers_json?: string; redclaw_compact_target_tokens?: number } | undefined>;
       getAppVersion: () => Promise<string>;
-      fetchModels: (config: { apiKey: string, baseURL: string }) => Promise<{ id: string }[]>;
+      fetchModels: (config: { apiKey: string, baseURL: string, presetId?: string, protocol?: 'openai' | 'anthropic' | 'gemini' }) => Promise<{ id: string }[]>;
+      detectAiProtocol: (config: { baseURL: string; presetId?: string; protocol?: string }) => Promise<{ success: boolean; protocol: 'openai' | 'anthropic' | 'gemini'; error?: string }>;
+      testAiConnection: (config: { apiKey: string; baseURL: string; presetId?: string; protocol?: 'openai' | 'anthropic' | 'gemini' }) => Promise<{ success: boolean; protocol: 'openai' | 'anthropic' | 'gemini'; models: Array<{ id: string }>; message: string }>;
       startChat: (message: string, modelConfig?: unknown) => void;
       cancelChat: () => void;
       confirmTool: (callId: string, confirmed: boolean) => void;
@@ -67,6 +69,29 @@ declare global {
         getMessages: (sessionId: string) => Promise<ChatMessage[]>;
         clearMessages: (sessionId: string) => Promise<{ success: boolean }>;
         compactContext: (sessionId: string) => Promise<{ success: boolean; compacted: boolean; message: string; compactRounds?: number; compactUpdatedAt?: string }>;
+        getContextUsage: (sessionId: string) => Promise<{
+          success: boolean;
+          error?: string;
+          sessionId?: string;
+          contextType?: string;
+          messageCount?: number;
+          compactBaseMessageCount?: number;
+          compactRounds?: number;
+          compactUpdatedAt?: string | null;
+          estimatedTotalTokens?: number;
+          compactSummaryTokens?: number;
+          activeHistoryTokens?: number;
+          compactThreshold?: number;
+          compactRatio?: number;
+        }>;
+        getRuntimeState: (sessionId: string) => Promise<{
+          success: boolean;
+          error?: string;
+          sessionId?: string;
+          isProcessing: boolean;
+          partialResponse: string;
+          updatedAt: number;
+        }>;
       };
       redclawRunner: {
         getStatus: () => Promise<{
@@ -93,6 +118,27 @@ declare global {
         runNow: (payload?: { projectId?: string }) => Promise<unknown>;
         setProject: (payload: { projectId: string; enabled: boolean; prompt?: string }) => Promise<unknown>;
         setConfig: (payload: { intervalMinutes?: number; keepAliveWhenNoWindow?: boolean; maxProjectsPerTick?: number }) => Promise<unknown>;
+      };
+      mcp: {
+        list: () => Promise<{ success: boolean; servers: Array<{
+          id: string;
+          name: string;
+          enabled: boolean;
+          transport: 'stdio' | 'sse' | 'streamable-http';
+          command?: string;
+          args?: string[];
+          env?: Record<string, string>;
+          url?: string;
+          oauth?: {
+            enabled?: boolean;
+            tokenPath?: string;
+          };
+        }> }>;
+        save: (servers: unknown[]) => Promise<{ success: boolean; servers?: unknown[]; error?: string }>;
+        test: (server: unknown) => Promise<{ success: boolean; message: string; detail?: string }>;
+        discoverLocal: () => Promise<{ success: boolean; items: Array<{ sourcePath: string; count: number; servers: unknown[] }>; error?: string }>;
+        importLocal: () => Promise<{ success: boolean; imported?: number; total?: number; sources?: string[]; servers?: unknown[]; error?: string }>;
+        oauthStatus: (serverId: string) => Promise<{ success: boolean; connected?: boolean; tokenPath?: string; error?: string }>;
       };
     };
   }

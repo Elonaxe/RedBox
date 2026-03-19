@@ -43,6 +43,27 @@ interface ChatProps {
   contentLayout?: 'default' | 'center-2-3';
 }
 
+interface ChatContextUsage {
+  success: boolean;
+  contextType?: string;
+  estimatedTotalTokens?: number;
+  compactThreshold?: number;
+  compactRatio?: number;
+  compactRounds?: number;
+  compactUpdatedAt?: string | null;
+}
+
+interface ChatRuntimeState {
+  success: boolean;
+  error?: string;
+  sessionId?: string;
+  isProcessing: boolean;
+  partialResponse: string;
+  updatedAt: number;
+}
+
+const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 80;
+
 export function Chat({
   pendingMessage,
   onMessageConsumed,
@@ -74,6 +95,7 @@ export function Chat({
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenu>({ visible: false, x: 0, y: 0, text: '' });
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
   const [showRoomPicker, setShowRoomPicker] = useState(false);
+  const [contextUsage, setContextUsage] = useState<ChatContextUsage | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -84,8 +106,32 @@ export function Chat({
   
   // 缓冲未处理的 chunk，用于解决页面加载期间的数据丢失问题
   const missedChunksRef = useRef<string>('');
+  const shouldAutoScrollRef = useRef(true);
   const centeredContent = contentLayout === 'center-2-3';
   const contentWidthClass = centeredContent ? 'w-2/3 mx-auto' : 'w-full';
+
+  const isNearBottom = useCallback((element: HTMLDivElement): boolean => {
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    return distance <= AUTO_SCROLL_BOTTOM_THRESHOLD_PX;
+  }, []);
+
+  const handleMessagesScroll = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    shouldAutoScrollRef.current = isNearBottom(container);
+  }, [isNearBottom]);
+
+  const loadContextUsage = useCallback(async (sessionId: string) => {
+    if (!sessionId) return;
+    try {
+      const usage = await window.ipcRenderer.chat.getContextUsage(sessionId);
+      if (usage?.success) {
+        setContextUsage(usage as ChatContextUsage);
+      }
+    } catch (error) {
+      console.error('Failed to load context usage:', error);
+    }
+  }, []);
 
   // 判断是否是空会话（新建或无消息）
   const isEmptySession = messages.length === 0;
@@ -104,13 +150,22 @@ export function Chat({
     if (messages.length === 0) return;
     requestAnimationFrame(() => {
       const container = messagesContainerRef.current;
-      if (container) {
+      if (container && shouldAutoScrollRef.current) {
         container.scrollTop = container.scrollHeight;
-      } else {
+      } else if (!container && shouldAutoScrollRef.current) {
         messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
       }
     });
   }, [messages, currentSessionId]);
+
+  useEffect(() => {
+    shouldAutoScrollRef.current = true;
+  }, [currentSessionId]);
+
+  useEffect(() => {
+    if (!fixedSessionId || !currentSessionId) return;
+    void loadContextUsage(currentSessionId);
+  }, [fixedSessionId, currentSessionId, messages.length, isProcessing, loadContextUsage]);
 
   // Load sessions on mount
   useEffect(() => {
@@ -231,7 +286,12 @@ export function Chat({
   const selectSession = async (sessionId: string) => {
     setCurrentSessionId(sessionId);
     try {
-      const history = await window.ipcRenderer.chat.getMessages(sessionId);
+      const [history, runtimeStateRaw] = await Promise.all([
+        window.ipcRenderer.chat.getMessages(sessionId),
+        window.ipcRenderer.chat.getRuntimeState(sessionId),
+      ]);
+      const runtimeState = runtimeStateRaw as ChatRuntimeState;
+
       // Convert DB messages to UI messages
       const uiMessages: Message[] = history.map((msg: any) => {
         // 解析 attachment（数据库中存储为 JSON 字符串）
@@ -256,8 +316,36 @@ export function Chat({
         };
       });
 
-      // 检查是否有缓冲的 missedChunks
-      if (missedChunksRef.current) {
+      const runtimeProcessing = Boolean(runtimeState?.success && runtimeState?.isProcessing);
+      const runtimePartial = runtimeState?.partialResponse || '';
+      let shouldSetProcessing = false;
+
+      // 优先恢复后端“仍在运行”的会话状态，避免切 tab 后看起来像任务中断
+      if (runtimeProcessing) {
+        const restoredContent = `${runtimePartial}${missedChunksRef.current || ''}`;
+        missedChunksRef.current = '';
+        const lastMsg = uiMessages[uiMessages.length - 1];
+        if (lastMsg && lastMsg.role === 'ai' && lastMsg.isStreaming) {
+          uiMessages[uiMessages.length - 1] = {
+            ...lastMsg,
+            content: restoredContent || lastMsg.content || '',
+            isStreaming: true,
+          };
+        } else {
+          uiMessages.push({
+            id: `streaming_${Date.now()}`,
+            role: 'ai',
+            content: restoredContent,
+            tools: [],
+            timeline: [],
+            isStreaming: true,
+          });
+        }
+        shouldSetProcessing = true;
+      }
+
+      // 检查是否有缓冲的 missedChunks（仅在后端当前不处于 processing 时回放）
+      if (!runtimeProcessing && missedChunksRef.current) {
         const chunk = missedChunksRef.current;
         missedChunksRef.current = ''; // 清空缓冲
 
@@ -270,7 +358,7 @@ export function Chat({
             content: lastMsg.content + chunk,
             isStreaming: true
           };
-          setIsProcessing(true); // 恢复 processing 状态
+          shouldSetProcessing = true; // 恢复 processing 状态
         } else {
           // 如果没有 AI 消息，创建一个新的
           uiMessages.push({
@@ -281,11 +369,12 @@ export function Chat({
             timeline: [],
             isStreaming: true
           });
-          setIsProcessing(true);
+          shouldSetProcessing = true;
         }
       }
 
       setMessages(uiMessages);
+      setIsProcessing(shouldSetProcessing);
     } catch (error) {
       console.error('Failed to load messages:', error);
     }
@@ -602,15 +691,16 @@ export function Chat({
         if (!lastMsg || lastMsg.role !== 'ai') return prev;
 
         const newTimeline = [...lastMsg.timeline];
-        
+
         // Add Tool Item to Timeline
         newTimeline.push({
             id: Math.random().toString(36),
             type: 'tool-call',
-            content: '', // Can be description
+            content: toolData.description || '',
             status: 'running',
             timestamp: Date.now(),
             toolData: {
+                callId: toolData.callId,
                 name: toolData.name,
                 input: toolData.input
             }
@@ -641,26 +731,41 @@ export function Chat({
 
         // Update Timeline
         const newTimeline = [...lastMsg.timeline];
-        // Find the tool item. Since callId isn't on ProcessItem root, we might need to store it or find by toolData.
-        // But for simplicity, we assume the last 'tool-call' running item is the one (since tools are usually sequential in our agent).
-        // A better way is to add callId to ProcessItem.
-        // Let's iterate backwards.
+        let matchedIndex = -1;
+
+        // Prefer exact match with callId
         for (let i = newTimeline.length - 1; i >= 0; i--) {
             if (newTimeline[i].type === 'tool-call' && newTimeline[i].status === 'running') {
-                // Check name if possible, or just assume order
-                if (newTimeline[i].toolData?.name === toolData.name) {
-                    newTimeline[i] = {
-                        ...newTimeline[i],
-                        status: toolData.output?.success ? 'done' : 'failed',
-                        duration: Date.now() - newTimeline[i].timestamp,
-                        toolData: {
-                            ...newTimeline[i].toolData!,
-                            output: toolData.output.content
-                        }
-                    };
-                    break;
+                if (newTimeline[i].toolData?.callId === toolData.callId) {
+                  matchedIndex = i;
+                  break;
                 }
             }
+        }
+
+        // Fallback by name for backward compatibility
+        if (matchedIndex === -1) {
+          for (let i = newTimeline.length - 1; i >= 0; i--) {
+              if (newTimeline[i].type === 'tool-call' && newTimeline[i].status === 'running') {
+                  if (newTimeline[i].toolData?.name === toolData.name) {
+                    matchedIndex = i;
+                    break;
+                  }
+              }
+          }
+        }
+
+        if (matchedIndex !== -1) {
+          const targetItem = newTimeline[matchedIndex];
+          newTimeline[matchedIndex] = {
+              ...targetItem,
+              status: toolData.output?.success ? 'done' : 'failed',
+              duration: Date.now() - targetItem.timestamp,
+              toolData: {
+                  ...targetItem.toolData!,
+                  output: toolData.output.content
+              }
+          };
         }
 
         // Update Legacy Tools
@@ -672,6 +777,64 @@ export function Chat({
             ...lastMsg, 
             timeline: newTimeline,
             tools: updatedTools 
+        }];
+      });
+    };
+
+    const handleToolUpdate = (_: unknown, toolData: { callId: string; name: string; partial: string }) => {
+      setMessages(prev => {
+        const lastMsg = prev[prev.length - 1];
+        if (!lastMsg || lastMsg.role !== 'ai') return prev;
+        if (!toolData?.partial) return prev;
+
+        const newTimeline = [...lastMsg.timeline];
+        let matchedIndex = -1;
+
+        for (let i = newTimeline.length - 1; i >= 0; i--) {
+          if (newTimeline[i].type === 'tool-call' && newTimeline[i].toolData?.callId === toolData.callId) {
+            matchedIndex = i;
+            break;
+          }
+        }
+
+        if (matchedIndex === -1) {
+          for (let i = newTimeline.length - 1; i >= 0; i--) {
+            if (
+              newTimeline[i].type === 'tool-call' &&
+              newTimeline[i].status === 'running' &&
+              newTimeline[i].toolData?.name === toolData.name
+            ) {
+              matchedIndex = i;
+              break;
+            }
+          }
+        }
+
+        if (matchedIndex === -1) return prev;
+
+        const targetItem = newTimeline[matchedIndex];
+        const currentOutput = targetItem.toolData?.output || '';
+        let mergedOutput = currentOutput;
+
+        if (!currentOutput) {
+          mergedOutput = toolData.partial;
+        } else if (toolData.partial.startsWith(currentOutput)) {
+          mergedOutput = toolData.partial;
+        } else if (!currentOutput.endsWith(toolData.partial)) {
+          mergedOutput = `${currentOutput}\n${toolData.partial}`;
+        }
+
+        newTimeline[matchedIndex] = {
+          ...targetItem,
+          toolData: {
+            ...targetItem.toolData!,
+            output: mergedOutput,
+          },
+        };
+
+        return [...prev.slice(0, -1), {
+          ...lastMsg,
+          timeline: newTimeline,
         }];
       });
     };
@@ -771,6 +934,7 @@ export function Chat({
     window.ipcRenderer.on('chat:thinking', handleThinking); // Keep legacy
     window.ipcRenderer.on('chat:response-chunk', handleResponseChunk);
     window.ipcRenderer.on('chat:tool-start', handleToolStart);
+    window.ipcRenderer.on('chat:tool-update', handleToolUpdate);
     window.ipcRenderer.on('chat:tool-end', handleToolEnd);
     window.ipcRenderer.on('chat:skill-activated', handleSkillActivated);
     window.ipcRenderer.on('chat:tool-confirm-request', handleConfirmRequest);
@@ -781,21 +945,22 @@ export function Chat({
     window.ipcRenderer.on('chat:plan-updated', handlePlanUpdated);
 
     return () => {
-      window.ipcRenderer.removeAllListeners('chat:phase-start');
-      window.ipcRenderer.removeAllListeners('chat:thought-start');
-      window.ipcRenderer.removeAllListeners('chat:thought-delta');
-      window.ipcRenderer.removeAllListeners('chat:thought-end');
-      window.ipcRenderer.removeAllListeners('chat:thinking');
-      window.ipcRenderer.removeAllListeners('chat:response-chunk');
-      window.ipcRenderer.removeAllListeners('chat:tool-start');
-      window.ipcRenderer.removeAllListeners('chat:tool-end');
-      window.ipcRenderer.removeAllListeners('chat:skill-activated');
-      window.ipcRenderer.removeAllListeners('chat:tool-confirm-request');
-      window.ipcRenderer.removeAllListeners('chat:response-end');
-      window.ipcRenderer.removeAllListeners('chat:done');
-      window.ipcRenderer.removeAllListeners('chat:error');
-      window.ipcRenderer.removeAllListeners('chat:session-title-updated');
-      window.ipcRenderer.removeAllListeners('chat:plan-updated');
+      window.ipcRenderer.off('chat:phase-start', handlePhaseStart);
+      window.ipcRenderer.off('chat:thought-start', handleThoughtStart);
+      window.ipcRenderer.off('chat:thought-delta', handleThoughtDelta);
+      window.ipcRenderer.off('chat:thought-end', handleThoughtEnd);
+      window.ipcRenderer.off('chat:thinking', handleThinking);
+      window.ipcRenderer.off('chat:response-chunk', handleResponseChunk);
+      window.ipcRenderer.off('chat:tool-start', handleToolStart);
+      window.ipcRenderer.off('chat:tool-update', handleToolUpdate);
+      window.ipcRenderer.off('chat:tool-end', handleToolEnd);
+      window.ipcRenderer.off('chat:skill-activated', handleSkillActivated);
+      window.ipcRenderer.off('chat:tool-confirm-request', handleConfirmRequest);
+      window.ipcRenderer.off('chat:response-end', handleResponseEnd);
+      window.ipcRenderer.off('chat:done', handleResponseEnd);
+      window.ipcRenderer.off('chat:error', handleError);
+      window.ipcRenderer.off('chat:session-title-updated', handleSessionTitleUpdated);
+      window.ipcRenderer.off('chat:plan-updated', handlePlanUpdated);
 
       // Cleanup timer
       if (updateTimerRef.current) {
@@ -812,6 +977,7 @@ export function Chat({
   };
 
   const sendMessage = (content: string) => {
+    shouldAutoScrollRef.current = true;
     const userMsg: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -852,6 +1018,13 @@ export function Chat({
     { label: '🔍 内容分析', text: '请深度分析当前内容，提炼核心观点。' },
     { label: '💡 创作建议', text: '请基于当前内容提供一些创作方向的建议。' }
   ];
+
+  const contextPercent = Math.max(0, Math.min(100, Math.round((contextUsage?.compactRatio || 0) * 100)));
+  const contextBadgeClass = contextPercent >= 90
+    ? 'text-red-600 border-red-500/40 bg-red-500/10'
+    : contextPercent >= 70
+      ? 'text-amber-600 border-amber-500/40 bg-amber-500/10'
+      : 'text-text-secondary border-border bg-surface-secondary/90';
 
   return (
     <div className="flex h-full">
@@ -938,10 +1111,15 @@ export function Chat({
 
         {/* Linked Session Indicator */}
         {fixedSessionId && currentSessionId && fixedSessionBannerText && (
-            <div className="absolute top-0 left-0 right-0 z-10 flex justify-center pointer-events-none">
+            <div className="absolute top-0 left-0 right-0 z-10 flex flex-col items-center gap-1 pointer-events-none">
                 <div className="bg-surface-secondary/90 backdrop-blur text-xs font-medium text-text-secondary px-3 py-1 rounded-b-lg shadow-sm border-b border-x border-border">
                    {fixedSessionBannerText}
                 </div>
+                {contextUsage?.success && (
+                  <div className={clsx('text-[11px] px-2.5 py-1 rounded-full border backdrop-blur', contextBadgeClass)}>
+                    上下文 {contextPercent}% · {contextUsage.estimatedTotalTokens || 0}/{contextUsage.compactThreshold || 0} tokens · compact {contextUsage.compactRounds || 0} 次
+                  </div>
+                )}
             </div>
         )}
 
@@ -1065,7 +1243,11 @@ export function Chat({
             )}
 
             {/* Messages */}
-            <div ref={messagesContainerRef} className="flex-1 overflow-y-auto px-6 py-6">
+            <div
+              ref={messagesContainerRef}
+              onScroll={handleMessagesScroll}
+              className="flex-1 overflow-y-auto px-6 py-6"
+            >
               <div className={clsx('space-y-8', contentWidthClass)}>
                 {messages.map((msg) => (
                   <ErrorBoundary key={msg.id} name={`MessageItem-${msg.id}`}>

@@ -32,12 +32,16 @@ const initDb = () => {
       transcription_model TEXT,
       transcription_endpoint TEXT,
       transcription_key TEXT,
+      ai_sources_json TEXT,
+      default_ai_source_id TEXT,
       image_provider TEXT,
       image_endpoint TEXT,
       image_api_key TEXT,
       image_model TEXT,
       image_size TEXT,
-      image_quality TEXT
+      image_quality TEXT,
+      mcp_servers_json TEXT,
+      redclaw_compact_target_tokens INTEGER
     );
   `);
 
@@ -161,6 +165,12 @@ const initDb = () => {
   try {
     db.exec(`ALTER TABLE settings ADD COLUMN embedding_model TEXT;`);
   } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN ai_sources_json TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN default_ai_source_id TEXT;`);
+  } catch { /* Column already exists */ }
 
   try {
     db.exec(`ALTER TABLE settings ADD COLUMN transcription_model TEXT;`);
@@ -188,6 +198,12 @@ const initDb = () => {
   } catch { /* Column already exists */ }
   try {
     db.exec(`ALTER TABLE settings ADD COLUMN image_quality TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN mcp_servers_json TEXT;`);
+  } catch { /* Column already exists */ }
+  try {
+    db.exec(`ALTER TABLE settings ADD COLUMN redclaw_compact_target_tokens INTEGER;`);
   } catch { /* Column already exists */ }
 
   try {
@@ -257,16 +273,20 @@ export const saveSettings = (settings: {
   embedding_endpoint?: string;
   embedding_key?: string;
   embedding_model?: string;
+  ai_sources_json?: string;
+  default_ai_source_id?: string;
   image_provider?: string;
   image_endpoint?: string;
   image_api_key?: string;
   image_model?: string;
   image_size?: string;
   image_quality?: string;
+  mcp_servers_json?: string;
+  redclaw_compact_target_tokens?: number;
 }) => {
   const stmt = db.prepare(`
-    INSERT INTO settings (id, api_endpoint, api_key, model_name, role_mapping, workspace_dir, active_space_id, transcription_model, transcription_endpoint, transcription_key, embedding_endpoint, embedding_key, embedding_model, image_provider, image_endpoint, image_api_key, image_model, image_size, image_quality)
-    VALUES (1, @api_endpoint, @api_key, @model_name, @role_mapping, @workspace_dir, @active_space_id, @transcription_model, @transcription_endpoint, @transcription_key, @embedding_endpoint, @embedding_key, @embedding_model, @image_provider, @image_endpoint, @image_api_key, @image_model, @image_size, @image_quality)
+    INSERT INTO settings (id, api_endpoint, api_key, model_name, role_mapping, workspace_dir, active_space_id, transcription_model, transcription_endpoint, transcription_key, embedding_endpoint, embedding_key, embedding_model, ai_sources_json, default_ai_source_id, image_provider, image_endpoint, image_api_key, image_model, image_size, image_quality, mcp_servers_json, redclaw_compact_target_tokens)
+    VALUES (1, @api_endpoint, @api_key, @model_name, @role_mapping, @workspace_dir, @active_space_id, @transcription_model, @transcription_endpoint, @transcription_key, @embedding_endpoint, @embedding_key, @embedding_model, @ai_sources_json, @default_ai_source_id, @image_provider, @image_endpoint, @image_api_key, @image_model, @image_size, @image_quality, @mcp_servers_json, @redclaw_compact_target_tokens)
     ON CONFLICT(id) DO UPDATE SET
       api_endpoint = @api_endpoint,
       api_key = @api_key,
@@ -280,14 +300,24 @@ export const saveSettings = (settings: {
       embedding_endpoint = @embedding_endpoint,
       embedding_key = @embedding_key,
       embedding_model = @embedding_model,
+      ai_sources_json = @ai_sources_json,
+      default_ai_source_id = @default_ai_source_id,
       image_provider = @image_provider,
       image_endpoint = @image_endpoint,
       image_api_key = @image_api_key,
       image_model = @image_model,
       image_size = @image_size,
-      image_quality = @image_quality
+      image_quality = @image_quality,
+      mcp_servers_json = @mcp_servers_json,
+      redclaw_compact_target_tokens = @redclaw_compact_target_tokens
   `);
-  const current = getSettings() as { active_space_id?: string } | undefined;
+  const current = getSettings() as {
+    active_space_id?: string;
+    ai_sources_json?: string;
+    default_ai_source_id?: string;
+    mcp_servers_json?: string;
+    redclaw_compact_target_tokens?: number;
+  } | undefined;
   return stmt.run({
     ...settings,
     role_mapping: typeof settings.role_mapping === 'object' ? JSON.stringify(settings.role_mapping) : (settings.role_mapping || '{}'),
@@ -299,12 +329,20 @@ export const saveSettings = (settings: {
     embedding_endpoint: settings.embedding_endpoint || '',
     embedding_key: settings.embedding_key || '',
     embedding_model: settings.embedding_model || '',
+    ai_sources_json: settings.ai_sources_json ?? current?.ai_sources_json ?? '',
+    default_ai_source_id: settings.default_ai_source_id ?? current?.default_ai_source_id ?? '',
     image_provider: settings.image_provider || '',
     image_endpoint: settings.image_endpoint || '',
     image_api_key: settings.image_api_key || '',
     image_model: settings.image_model || '',
     image_size: settings.image_size || '',
-    image_quality: settings.image_quality || ''
+    image_quality: settings.image_quality || '',
+    mcp_servers_json: settings.mcp_servers_json ?? current?.mcp_servers_json ?? '[]',
+    redclaw_compact_target_tokens: Number.isFinite(Number(settings.redclaw_compact_target_tokens))
+      ? Math.floor(Number(settings.redclaw_compact_target_tokens))
+      : Number.isFinite(Number(current?.redclaw_compact_target_tokens))
+        ? Math.floor(Number(current?.redclaw_compact_target_tokens))
+        : 256000,
   });
 };
 
@@ -323,12 +361,16 @@ export const getSettings = () => {
     embedding_endpoint?: string;
     embedding_key?: string;
     embedding_model?: string;
+    ai_sources_json?: string;
+    default_ai_source_id?: string;
     image_provider?: string;
     image_endpoint?: string;
     image_api_key?: string;
     image_model?: string;
     image_size?: string;
     image_quality?: string;
+    mcp_servers_json?: string;
+    redclaw_compact_target_tokens?: number;
   } | undefined;
   // Ensure workspace_dir has a default value
   if (result && !result.workspace_dir) {
@@ -336,6 +378,12 @@ export const getSettings = () => {
   }
   if (result && !result.active_space_id) {
     result.active_space_id = DEFAULT_SPACE_ID;
+  }
+  if (result && !result.mcp_servers_json) {
+    result.mcp_servers_json = '[]';
+  }
+  if (result && !Number.isFinite(Number(result.redclaw_compact_target_tokens))) {
+    result.redclaw_compact_target_tokens = 256000;
   }
   return result;
 };

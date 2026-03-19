@@ -32,10 +32,20 @@ export default defineConfig({
         // Shortcut of `build.lib.entry`.
         entry: 'electron/main.ts',
         vite: {
+          resolve: {
+            alias: [
+              {
+                find: /^ws$/,
+                replacement: path.resolve(__dirname, 'electron/shims/ws-interop-safe.mjs'),
+              },
+            ],
+          },
           build: {
             rollupOptions: {
-              // Keep native module external; bundle JS AI SDKs to avoid runtime missing deps in app.asar.
-              external: ['better-sqlite3'],
+              // Keep native/optional-node deps external.
+              // `ws` has optional deps (`bufferutil` / `utf-8-validate`) that should be resolved at runtime
+              // instead of being force-bundled by Rollup.
+              external: ['better-sqlite3', 'bufferutil', 'utf-8-validate'],
             },
           },
         },

@@ -42,7 +42,9 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
   getAppVersion: () => ipcRenderer.invoke('app:get-version'),
 
   // AI (Legacy)
-  fetchModels: (config: { apiKey: string, baseURL: string }) => ipcRenderer.invoke('ai:fetch-models', config),
+  fetchModels: (config: { apiKey: string, baseURL: string, presetId?: string, protocol?: 'openai' | 'anthropic' | 'gemini' }) => ipcRenderer.invoke('ai:fetch-models', config),
+  detectAiProtocol: (config: { baseURL: string, presetId?: string, protocol?: string }) => ipcRenderer.invoke('ai:detect-protocol', config),
+  testAiConnection: (config: { apiKey: string, baseURL: string, presetId?: string, protocol?: 'openai' | 'anthropic' | 'gemini' }) => ipcRenderer.invoke('ai:test-connection', config),
   startChat: (message: string, modelConfig?: unknown) => ipcRenderer.send('ai:start-chat', message, modelConfig),
   cancelChat: () => ipcRenderer.send('ai:cancel'),
   confirmTool: (callId: string, confirmed: boolean) => ipcRenderer.send('ai:confirm-tool', callId, confirmed),
@@ -59,6 +61,8 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
     getMessages: (sessionId: string) => ipcRenderer.invoke('chat:get-messages', sessionId),
     clearMessages: (sessionId: string) => ipcRenderer.invoke('chat:clear-messages', sessionId),
     compactContext: (sessionId: string) => ipcRenderer.invoke('chat:compact-context', sessionId),
+    getContextUsage: (sessionId: string) => ipcRenderer.invoke('chat:get-context-usage', sessionId),
+    getRuntimeState: (sessionId: string) => ipcRenderer.invoke('chat:get-runtime-state', sessionId),
   },
 
   redclawRunner: {
@@ -72,6 +76,14 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
 
   // Skills
   listSkills: () => ipcRenderer.invoke('skills:list'),
+  mcp: {
+    list: () => ipcRenderer.invoke('mcp:list'),
+    save: (servers: unknown[]) => ipcRenderer.invoke('mcp:save', { servers }),
+    test: (server: unknown) => ipcRenderer.invoke('mcp:test', { server }),
+    discoverLocal: () => ipcRenderer.invoke('mcp:discover-local'),
+    importLocal: () => ipcRenderer.invoke('mcp:import-local'),
+    oauthStatus: (serverId: string) => ipcRenderer.invoke('mcp:oauth-status', { serverId }),
+  },
 
   // YouTube Import
   checkYtdlp: () => ipcRenderer.invoke('youtube:check-ytdlp'),

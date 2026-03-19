@@ -5,7 +5,13 @@
  */
 
 import { BrowserWindow } from 'electron';
-import { Agent, type AgentEvent, type AgentTool } from '@mariozechner/pi-agent-core';
+import {
+  Agent,
+  type AgentEvent,
+  type AgentTool,
+  type BeforeToolCallResult,
+  type AfterToolCallResult,
+} from '@mariozechner/pi-agent-core';
 import { getModel, type Model } from '@mariozechner/pi-ai';
 import {
   getSettings,
@@ -28,6 +34,7 @@ import { createBuiltinTools } from '../core/tools';
 import { createCompressionService } from '../core/compressionService';
 import { getLongTermMemoryPrompt } from '../core/fileMemoryStore';
 import { getRedClawProjectContextPrompt } from '../core/redclawStore';
+import { getMcpServers } from '../core/mcpStore';
 
 interface SessionMetadata {
   associatedFilePath?: string;
@@ -78,7 +85,26 @@ interface CompactContextResult {
   compactUpdatedAt?: string;
 }
 
+interface SessionRuntimeState {
+  isProcessing: boolean;
+  partialResponse: string;
+  updatedAt: number;
+}
+
 const DEFAULT_REDCLAW_AUTO_COMPACT_TOKENS = 256000;
+const TOOL_GUARD_MAX_TOTAL_CALLS = 24;
+const TOOL_GUARD_MAX_CALLS_PER_TOOL = 12;
+const TOOL_GUARD_MAX_REPEAT_SIGNATURE = 3;
+const TOOL_RESULT_MAX_TEXT_CHARS = 32000;
+const TOOL_RESULT_MAX_LLM_CHARS = 22000;
+const TOOL_RESULT_MAX_DISPLAY_CHARS = 26000;
+const TOOL_RESULT_MAX_ERROR_CHARS = 4000;
+
+interface ToolGuardState {
+  totalCalls: number;
+  callsByTool: Map<string, number>;
+  callsBySignature: Map<string, number>;
+}
 
 export class PiChatService {
   private window: BrowserWindow | null = null;
@@ -89,6 +115,11 @@ export class PiChatService {
   private unsubscribeAgentEvents: (() => void) | null = null;
   private toolRegistry: ToolRegistry;
   private toolExecutor: ToolExecutor;
+  private runtimeState: SessionRuntimeState = {
+    isProcessing: false,
+    partialResponse: '',
+    updatedAt: 0,
+  };
 
   constructor() {
     this.sessionId = `session_${Date.now()}`;
@@ -144,9 +175,27 @@ export class PiChatService {
     }
   }
 
+  getRuntimeState(): SessionRuntimeState {
+    return {
+      ...this.runtimeState,
+    };
+  }
+
+  private setRuntimeState(next: Partial<SessionRuntimeState>) {
+    this.runtimeState = {
+      ...this.runtimeState,
+      ...next,
+      updatedAt: Date.now(),
+    };
+  }
+
   clearHistory() {
     this.sessionId = `session_${Date.now()}`;
     this.skillManager.resetActiveSkills();
+    this.setRuntimeState({
+      isProcessing: false,
+      partialResponse: '',
+    });
 
     if (this.agent) {
       this.agent.clearMessages();
@@ -258,6 +307,11 @@ export class PiChatService {
       redClawCompactTargetTokens,
     });
 
+    this.setRuntimeState({
+      isProcessing: true,
+      partialResponse: '',
+    });
+
     try {
       const runResult = await this.runAgentAttempt({
         model,
@@ -277,6 +331,7 @@ export class PiChatService {
 
       const fullResponse = runResult.response || '';
       if (fullResponse) {
+        this.setRuntimeState({ partialResponse: fullResponse });
         addChatMessage({
           id: `msg_${Date.now()}`,
           session_id: sessionId,
@@ -295,6 +350,9 @@ export class PiChatService {
     } finally {
       this.cleanupAgentSubscription();
       this.abortController = null;
+      this.setRuntimeState({
+        isProcessing: false,
+      });
       this.sendToUI('chat:done', {});
     }
   }
@@ -318,8 +376,9 @@ export class PiChatService {
     const runtime = {
       response: '',
     };
+    const toolGuardState = this.createToolGuardState();
 
-    this.agent = this.createAgent(model, apiKey, prompt, history, signal);
+    this.agent = this.createAgent(model, apiKey, prompt, history, signal, toolGuardState);
 
     this.cleanupAgentSubscription();
     this.unsubscribeAgentEvents = this.agent.subscribe((event: AgentEvent) => {
@@ -343,6 +402,7 @@ export class PiChatService {
             const delta = event.assistantMessageEvent.delta;
             if (delta) {
               runtime.response += delta;
+              this.setRuntimeState({ partialResponse: runtime.response });
               this.sendToUI('chat:response-chunk', { content: delta });
             }
           }
@@ -354,6 +414,7 @@ export class PiChatService {
             const text = this.extractText(msg.content);
             if (text) {
               runtime.response = text;
+              this.setRuntimeState({ partialResponse: runtime.response });
               this.sendToUI('chat:response-chunk', { content: text });
             }
           }
@@ -374,6 +435,23 @@ export class PiChatService {
             description: `执行工具: ${event.toolName}`,
           });
           break;
+
+        case 'tool_execution_update': {
+          const partialText = this.toolExecutionUpdateToText(event.partialResult);
+          if (!partialText) break;
+          console.log('[PiChatService] tool:update', {
+            sessionId: this.sessionId,
+            callId: event.toolCallId,
+            name: event.toolName,
+            partialPreview: this.previewForLog(partialText),
+          });
+          this.sendToUI('chat:tool-update', {
+            callId: event.toolCallId,
+            name: event.toolName,
+            partial: partialText,
+          });
+          break;
+        }
 
         case 'tool_execution_end': {
           const output = this.toolExecutionToOutput(event.result, event.isError);
@@ -434,6 +512,7 @@ export class PiChatService {
     systemPrompt: string,
     history: Array<{ role: 'user' | 'assistant'; content: Array<{ type: 'text'; text: string }>; timestamp: number }>,
     signal: AbortSignal,
+    toolGuardState: ToolGuardState,
   ): Agent {
     const agent = new Agent({
       initialState: {
@@ -441,6 +520,12 @@ export class PiChatService {
         thinkingLevel: 'off',
       },
       getApiKey: async () => apiKey,
+      beforeToolCall: async ({ toolCall, args }): Promise<BeforeToolCallResult | undefined> => {
+        return this.guardBeforeToolCall(toolCall?.id || '', toolCall?.name || '', args, toolGuardState);
+      },
+      afterToolCall: async ({ toolCall, result, isError }): Promise<AfterToolCallResult | undefined> => {
+        return this.guardAfterToolCall(toolCall?.name || '', result, isError);
+      },
     });
 
     agent.setSystemPrompt(systemPrompt);
@@ -448,6 +533,222 @@ export class PiChatService {
     agent.replaceMessages(history as any[]);
 
     return agent;
+  }
+
+  private createToolGuardState(): ToolGuardState {
+    return {
+      totalCalls: 0,
+      callsByTool: new Map<string, number>(),
+      callsBySignature: new Map<string, number>(),
+    };
+  }
+
+  private async guardBeforeToolCall(
+    callId: string,
+    toolName: string,
+    args: unknown,
+    state: ToolGuardState,
+  ): Promise<BeforeToolCallResult | undefined> {
+    const normalizedToolName = (toolName || 'unknown').trim() || 'unknown';
+    state.totalCalls += 1;
+
+    const currentToolCount = (state.callsByTool.get(normalizedToolName) || 0) + 1;
+    state.callsByTool.set(normalizedToolName, currentToolCount);
+
+    const signature = this.buildToolCallSignature(normalizedToolName, args);
+    const currentSignatureCount = (state.callsBySignature.get(signature) || 0) + 1;
+    state.callsBySignature.set(signature, currentSignatureCount);
+
+    let blockReason = '';
+    if (state.totalCalls > TOOL_GUARD_MAX_TOTAL_CALLS) {
+      blockReason = `Tool 调用次数超过上限(${TOOL_GUARD_MAX_TOTAL_CALLS})，已阻止继续调用。请基于现有结果给出结论。`;
+    } else if (currentToolCount > TOOL_GUARD_MAX_CALLS_PER_TOOL) {
+      blockReason = `工具 ${normalizedToolName} 调用次数超过上限(${TOOL_GUARD_MAX_CALLS_PER_TOOL})，疑似进入循环。请改为总结已有结果。`;
+    } else if (currentSignatureCount > TOOL_GUARD_MAX_REPEAT_SIGNATURE) {
+      blockReason = `检测到重复工具调用(${normalizedToolName})参数完全一致，已阻止第 ${currentSignatureCount} 次重复。请先分析已有输出。`;
+    }
+
+    if (!blockReason) {
+      return undefined;
+    }
+
+    console.warn('[PiChatService] tool:guard-blocked', {
+      sessionId: this.sessionId,
+      callId,
+      toolName: normalizedToolName,
+      totalCalls: state.totalCalls,
+      toolCalls: currentToolCount,
+      signatureCalls: currentSignatureCount,
+      reason: blockReason,
+    });
+
+    this.sendToUI('chat:tool-update', {
+      callId,
+      name: normalizedToolName,
+      partial: `[Guard] ${blockReason}`,
+    });
+
+    return {
+      block: true,
+      reason: blockReason,
+    };
+  }
+
+  private async guardAfterToolCall(
+    toolName: string,
+    result: unknown,
+    isError: boolean,
+  ): Promise<AfterToolCallResult | undefined> {
+    const sanitized = this.sanitizeToolHookResult(result);
+    if (!sanitized.changed) {
+      return undefined;
+    }
+
+    console.log('[PiChatService] tool:guard-sanitized', {
+      sessionId: this.sessionId,
+      toolName,
+      isError,
+      truncated: true,
+      contentPreview: this.previewForLog(sanitized.content),
+    });
+
+    return {
+      content: sanitized.content,
+      details: sanitized.details,
+      isError,
+    };
+  }
+
+  private sanitizeToolHookResult(result: unknown): {
+    changed: boolean;
+    content?: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>;
+    details?: unknown;
+  } {
+    const wrapped = (result || {}) as { content?: unknown; details?: unknown };
+    let changed = false;
+
+    let nextContent = wrapped.content as Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }> | undefined;
+    if (Array.isArray(nextContent)) {
+      const patched = nextContent.map((block) => {
+        if (!block || typeof block !== 'object' || block.type !== 'text' || typeof block.text !== 'string') {
+          return block;
+        }
+        const sanitized = this.sanitizePlainText(block.text);
+        const trimmed = this.truncateToolText(sanitized, TOOL_RESULT_MAX_TEXT_CHARS, 'tool content');
+        if (trimmed !== block.text) {
+          changed = true;
+          return {
+            ...block,
+            text: trimmed,
+          };
+        }
+        return block;
+      });
+      nextContent = patched;
+    }
+
+    let nextDetails: unknown = wrapped.details;
+    if (wrapped.details && typeof wrapped.details === 'object') {
+      const details = wrapped.details as Record<string, unknown>;
+      const patched: Record<string, unknown> = { ...details };
+
+      if (typeof patched.llmContent === 'string') {
+        const sanitized = this.sanitizePlainText(patched.llmContent);
+        const trimmed = this.truncateToolText(sanitized, TOOL_RESULT_MAX_LLM_CHARS, 'llmContent');
+        if (trimmed !== patched.llmContent) {
+          changed = true;
+          patched.llmContent = trimmed;
+        }
+      }
+
+      if (typeof patched.display === 'string') {
+        const sanitized = this.sanitizePlainText(patched.display);
+        const trimmed = this.truncateToolText(sanitized, TOOL_RESULT_MAX_DISPLAY_CHARS, 'display');
+        if (trimmed !== patched.display) {
+          changed = true;
+          patched.display = trimmed;
+        }
+      }
+
+      if (patched.error && typeof patched.error === 'object') {
+        const errorObj = { ...(patched.error as Record<string, unknown>) };
+        if (typeof errorObj.message === 'string') {
+          const sanitized = this.sanitizePlainText(errorObj.message);
+          const trimmed = this.truncateToolText(sanitized, TOOL_RESULT_MAX_ERROR_CHARS, 'error');
+          if (trimmed !== errorObj.message) {
+            changed = true;
+            errorObj.message = trimmed;
+          }
+        }
+        patched.error = errorObj;
+      }
+
+      nextDetails = patched;
+    } else if (typeof wrapped.details === 'string') {
+      const sanitized = this.sanitizePlainText(wrapped.details);
+      const trimmed = this.truncateToolText(sanitized, TOOL_RESULT_MAX_LLM_CHARS, 'details');
+      if (trimmed !== wrapped.details) {
+        changed = true;
+        nextDetails = trimmed;
+      }
+    }
+
+    return {
+      changed,
+      content: nextContent,
+      details: nextDetails,
+    };
+  }
+
+  private sanitizePlainText(text: string): string {
+    return String(text || '')
+      .replace(/\u0000/g, '')
+      .replace(/\r\n/g, '\n');
+  }
+
+  private truncateToolText(text: string, maxChars: number, field: string): string {
+    if (text.length <= maxChars) {
+      return text;
+    }
+    const omitted = text.length - maxChars;
+    return `${text.slice(0, maxChars)}\n\n[${field} 过长，已截断 ${omitted} 字符]`;
+  }
+
+  private buildToolCallSignature(toolName: string, args: unknown): string {
+    const normalized = this.stableStringifyForSignature(args);
+    return `${toolName}:${normalized.slice(0, 800)}`;
+  }
+
+  private stableStringifyForSignature(value: unknown, depth = 0): string {
+    if (depth > 5) return '"[depth-limit]"';
+    if (value === null) return 'null';
+    if (value === undefined) return 'undefined';
+
+    const valueType = typeof value;
+    if (valueType === 'string') {
+      const text = value as string;
+      return JSON.stringify(text.length > 240 ? `${text.slice(0, 240)}...<truncated>` : text);
+    }
+    if (valueType === 'number' || valueType === 'boolean') {
+      return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+      const items = value.slice(0, 16).map((item) => this.stableStringifyForSignature(item, depth + 1));
+      const suffix = value.length > 16 ? ', "...<truncated-array>"' : '';
+      return `[${items.join(', ')}${suffix}]`;
+    }
+    if (valueType === 'object') {
+      const objectValue = value as Record<string, unknown>;
+      const keys = Object.keys(objectValue).sort();
+      const limitedKeys = keys.slice(0, 20);
+      const segments = limitedKeys.map((key) => `${JSON.stringify(key)}:${this.stableStringifyForSignature(objectValue[key], depth + 1)}`);
+      if (keys.length > 20) {
+        segments.push('"...<truncated-object>":true');
+      }
+      return `{${segments.join(',')}}`;
+    }
+
+    return JSON.stringify(String(value));
   }
 
   private async ensureSkillsDiscovered(workspace: string): Promise<void> {
@@ -614,6 +915,13 @@ export class PiChatService {
       success: !isError,
       content: this.extractText(wrapped?.content),
     };
+  }
+
+  private toolExecutionUpdateToText(partialResult: unknown): string {
+    const output = this.toolExecutionToOutput(partialResult, false).content;
+    if (output && output.trim()) return output;
+    if (typeof partialResult === 'string') return partialResult;
+    return '';
   }
 
   private getSessionMetadata(sessionId: string): SessionMetadata {
@@ -890,6 +1198,7 @@ export class PiChatService {
     const workspace = workspacePaths.base;
     const skillsXml = this.skillManager.getSkillsXml();
     const activeSkills = this.skillManager.getActiveSkills();
+    const mcpServers = getMcpServers().filter((server) => server.enabled);
 
     const promptParts: string[] = [
       '# 工作环境',
@@ -943,7 +1252,25 @@ export class PiChatService {
       '- 稿件列表: `app_cli(command="manuscripts list")`',
       '- RedClaw建项目: `app_cli(command="redclaw create --goal \\"做一个小红书选题\\"")`',
       '- 生图入媒体库: `app_cli(command="image generate --prompt \\"...\\\" --count 2")`',
+      '- MCP列表: `app_cli(command="mcp list --enabled-only true")`',
+      '- MCP工具清单: `app_cli(command="mcp tools --id <server-id>")`',
+      '- MCP工具调用: `app_cli(command="mcp call --id <server-id> --tool <tool-name> --args \\"{...}\\"")`',
+      '- MCP连通性测试: `app_cli(command="mcp test --id <server-id>")`',
     ];
+
+    if (mcpServers.length > 0) {
+      promptParts.push(
+        '',
+        '## 已配置 MCP 数据源（启用）',
+        ...mcpServers.slice(0, 20).map((server) => {
+          if (server.transport === 'stdio') {
+            return `- ${server.id}: ${server.name} [stdio] command=${server.command || '(missing)'}`;
+          }
+          return `- ${server.id}: ${server.name} [${server.transport}] url=${server.url || '(missing)'}`;
+        }),
+        '- 如需使用/检查数据源，优先调用 `app_cli` 的 mcp 子命令。',
+      );
+    }
 
     if (longTermMemory) {
       promptParts.push(

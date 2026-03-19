@@ -56,6 +56,14 @@ import {
 } from '../mediaLibraryStore';
 import { generateImagesToMediaLibrary } from '../imageGenerationService';
 import { SkillManager } from '../skillManager';
+import {
+    getMcpServers,
+    saveMcpServers,
+    testMcpServerConnection,
+    importLocalMcpServers,
+    getMcpOAuthStatus,
+} from '../mcpStore';
+import { listMcpTools, callMcpTool } from '../mcpRuntime';
 
 const AppCliParamsSchema = z.object({
     command: z.string().min(1).describe('CLI command. Example: "redclaw list --limit 20"'),
@@ -228,6 +236,11 @@ function helpText(): string {
         '- media list --limit 100',
         '- media bind --asset-id media_xxx --manuscript-path "redclaw/rc_xxx.md"',
         '- image generate --prompt "..." --project-id rc_xxx --count 2',
+        '- mcp list',
+        '- mcp import-local',
+        '- mcp tools --id filesystem',
+        '- mcp test --id filesystem',
+        '- mcp call --id filesystem --tool read_file --args "{\\"path\\":\\"/tmp/demo.txt\\"}"',
         '- archives profiles',
         '- wander list',
         '',
@@ -351,6 +364,8 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 return this.handleMedia(parsed, payload);
             case 'image':
                 return this.handleImage(parsed, payload);
+            case 'mcp':
+                return this.handleMcp(parsed, payload);
             case 'settings':
                 return this.handleSettings(parsed, payload);
             case 'skills':
@@ -872,6 +887,87 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
         };
     }
 
+    private async handleMcp(parsed: ParsedCommand, payload: Record<string, unknown>) {
+        const action = parsed.action;
+        if (action === 'list') {
+            const enabledOnly = parseBoolean(readFlag(parsed.flags, 'enabled-only') || payload.enabledOnly);
+            const servers = getMcpServers();
+            const filtered = enabledOnly ? servers.filter((server) => server.enabled) : servers;
+            return { count: filtered.length, servers: filtered };
+        }
+
+        if (action === 'import-local') {
+            return importLocalMcpServers();
+        }
+
+        if (action === 'test') {
+            const id = requireString(readFlag(parsed.flags, 'id', 'server-id') || payload.id, 'id');
+            const server = getMcpServers().find((item) => item.id === id);
+            if (!server) throw new Error(`MCP server not found: ${id}`);
+            const result = await testMcpServerConnection(server);
+            return { id, ...result };
+        }
+
+        if (action === 'tools') {
+            const id = requireString(readFlag(parsed.flags, 'id', 'server-id') || payload.id, 'id');
+            const server = getMcpServers().find((item) => item.id === id);
+            if (!server) throw new Error(`MCP server not found: ${id}`);
+            const tools = await listMcpTools(server);
+            return {
+                id,
+                count: tools.length,
+                tools,
+            };
+        }
+
+        if (action === 'call') {
+            const id = requireString(readFlag(parsed.flags, 'id', 'server-id') || payload.id, 'id');
+            const toolName = requireString(readFlag(parsed.flags, 'tool', 'name') || payload.tool, 'tool');
+            const server = getMcpServers().find((item) => item.id === id);
+            if (!server) throw new Error(`MCP server not found: ${id}`);
+
+            let args: Record<string, unknown> = {};
+            const rawArgs = readFlag(parsed.flags, 'args') || payload.args;
+            if (rawArgs !== undefined && rawArgs !== null) {
+                if (typeof rawArgs === 'string') {
+                    try {
+                        args = JSON.parse(rawArgs) as Record<string, unknown>;
+                    } catch {
+                        throw new Error('args must be valid JSON object');
+                    }
+                } else if (typeof rawArgs === 'object') {
+                    args = rawArgs as Record<string, unknown>;
+                }
+            }
+
+            const result = await callMcpTool(server, toolName, args);
+            return {
+                id,
+                tool: toolName,
+                args,
+                result,
+            };
+        }
+
+        if (action === 'oauth-status') {
+            const id = requireString(readFlag(parsed.flags, 'id', 'server-id') || payload.id, 'id');
+            const result = await getMcpOAuthStatus(id);
+            return { id, ...result };
+        }
+
+        if (action === 'enable' || action === 'disable') {
+            const id = requireString(readFlag(parsed.flags, 'id', 'server-id') || payload.id, 'id');
+            const enabled = action === 'enable';
+            const servers = getMcpServers().map((server) => (
+                server.id === id ? { ...server, enabled } : server
+            ));
+            const saved = saveMcpServers(servers);
+            return { success: true, id, enabled, count: saved.length };
+        }
+
+        throw new Error(`Unsupported mcp action: ${action}`);
+    }
+
     private async handleSettings(parsed: ParsedCommand, payload: Record<string, unknown>) {
         if (parsed.action === 'get') {
             const settings = (getSettings() || {}) as Record<string, unknown>;
@@ -901,12 +997,20 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 embedding_endpoint: String(next.embedding_endpoint || ''),
                 embedding_key: String(next.embedding_key || ''),
                 embedding_model: String(next.embedding_model || ''),
+                ai_sources_json: typeof next.ai_sources_json === 'string'
+                    ? next.ai_sources_json
+                    : JSON.stringify(next.ai_sources_json || []),
+                default_ai_source_id: String(next.default_ai_source_id || ''),
                 image_provider: String(next.image_provider || ''),
                 image_endpoint: String(next.image_endpoint || ''),
                 image_api_key: String(next.image_api_key || ''),
                 image_model: String(next.image_model || ''),
                 image_size: String(next.image_size || ''),
                 image_quality: String(next.image_quality || ''),
+                mcp_servers_json: typeof next.mcp_servers_json === 'string'
+                    ? next.mcp_servers_json
+                    : JSON.stringify(next.mcp_servers_json || []),
+                redclaw_compact_target_tokens: Number(next.redclaw_compact_target_tokens || 256000),
             });
             return { success: true, key, value };
         }
