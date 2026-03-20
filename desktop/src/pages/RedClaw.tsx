@@ -1,5 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Download, Loader2, Minimize2, Settings2, Trash2, X } from 'lucide-react';
+import {
+    Bot,
+    Check,
+    ChevronLeft,
+    ChevronRight,
+    Clock3,
+    Download,
+    Loader2,
+    Minimize2,
+    Play,
+    RefreshCw,
+    Sparkles,
+    Trash2,
+    X,
+} from 'lucide-react';
 import { clsx } from 'clsx';
 import { Chat } from './Chat';
 
@@ -23,6 +37,215 @@ const REDCLAW_WELCOME_SHORTCUTS = [
     { label: '✍️ 继续文案', text: '继续当前项目，先回顾项目状态，再完成文案包。' },
     { label: '🎨 继续配图', text: '继续当前项目，完善封面和配图提示词，并保存配图包。' },
     { label: '🔁 做复盘', text: '我已经发布了内容，请引导我输入数据并完成复盘。' },
+];
+
+const RUNNER_INTERVAL_OPTIONS = [10, 20, 30, 60];
+const RUNNER_MAX_AUTOMATION_OPTIONS = [1, 2, 3, 5];
+const HEARTBEAT_INTERVAL_OPTIONS = [15, 30, 60, 120];
+
+type ScheduleMode = 'interval' | 'daily' | 'weekly' | 'once';
+type RunnerResult = 'success' | 'error' | 'skipped';
+
+type SidebarTab = 'automation' | 'skills';
+
+interface RunnerScheduledTask {
+    id: string;
+    name: string;
+    enabled: boolean;
+    mode: ScheduleMode;
+    prompt: string;
+    projectId?: string;
+    intervalMinutes?: number;
+    time?: string;
+    weekdays?: number[];
+    runAt?: string;
+    createdAt: string;
+    updatedAt: string;
+    lastRunAt?: string;
+    lastResult?: RunnerResult;
+    lastError?: string;
+    nextRunAt?: string;
+}
+
+interface RunnerLongCycleTask {
+    id: string;
+    name: string;
+    enabled: boolean;
+    status: 'running' | 'paused' | 'completed';
+    objective: string;
+    stepPrompt: string;
+    projectId?: string;
+    intervalMinutes: number;
+    totalRounds: number;
+    completedRounds: number;
+    createdAt: string;
+    updatedAt: string;
+    lastRunAt?: string;
+    lastResult?: RunnerResult;
+    lastError?: string;
+    nextRunAt?: string;
+}
+
+interface RunnerStatus {
+    enabled: boolean;
+    intervalMinutes: number;
+    keepAliveWhenNoWindow: boolean;
+    maxProjectsPerTick: number;
+    maxAutomationPerTick?: number;
+    isTicking: boolean;
+    currentProjectId: string | null;
+    currentAutomationTaskId?: string | null;
+    lastTickAt: string | null;
+    nextTickAt: string | null;
+    nextMaintenanceAt?: string | null;
+    lastError: string | null;
+    heartbeat?: {
+        enabled: boolean;
+        intervalMinutes: number;
+        suppressEmptyReport: boolean;
+        reportToMainSession: boolean;
+        prompt?: string;
+        lastRunAt?: string;
+        nextRunAt?: string;
+        lastDigest?: string;
+    };
+    scheduledTasks?: Record<string, RunnerScheduledTask>;
+    longCycleTasks?: Record<string, RunnerLongCycleTask>;
+}
+
+interface RedClawProjectSummary {
+    id: string;
+    goal: string;
+    status: string;
+    updatedAt: string;
+}
+
+interface ScheduleTemplate {
+    id: string;
+    label: string;
+    description: string;
+    name: string;
+    mode: ScheduleMode;
+    intervalMinutes?: number;
+    time?: string;
+    weekdays?: number[];
+    prompt: string;
+}
+
+interface LongTemplate {
+    id: string;
+    label: string;
+    description: string;
+    name: string;
+    objective: string;
+    stepPrompt: string;
+    intervalMinutes: number;
+    totalRounds: number;
+}
+
+interface ScheduleDraft {
+    templateId: string;
+    name: string;
+    mode: ScheduleMode;
+    projectId: string;
+    intervalMinutes: number;
+    time: string;
+    weekdays: number[];
+    runAtLocal: string;
+    prompt: string;
+}
+
+interface LongDraft {
+    templateId: string;
+    name: string;
+    projectId: string;
+    objective: string;
+    stepPrompt: string;
+    intervalMinutes: number;
+    totalRounds: number;
+}
+
+const SCHEDULE_TEMPLATES: ScheduleTemplate[] = [
+    {
+        id: 'daily-creation',
+        label: '每日创作推进',
+        description: '每天自动推进当前项目的文案与发布计划',
+        name: '每日创作推进',
+        mode: 'daily',
+        time: '09:30',
+        prompt: '请优先选择当前最重要的 RedClaw 项目，推进一次完整创作流程：补齐标题候选、正文、标签和发布计划，并保存文案包。',
+    },
+    {
+        id: 'daily-image',
+        label: '每日配图完善',
+        description: '每天补齐封面与配图提示词并保存',
+        name: '每日配图完善',
+        mode: 'daily',
+        time: '14:00',
+        prompt: '请检查当前重点项目的配图状态，产出封面和配图提示词并保存配图包；若已有配图包，迭代优化。',
+    },
+    {
+        id: 'weekly-retro',
+        label: '每周复盘',
+        description: '固定每周总结执行结果并给出下一步',
+        name: '每周复盘',
+        mode: 'weekly',
+        time: '21:00',
+        weekdays: [1, 4],
+        prompt: '请对本周 RedClaw 项目执行情况进行复盘，输出有效动作、问题、下周假设和优先级动作。',
+    },
+    {
+        id: 'interval-watch',
+        label: '短周期巡检',
+        description: '按固定间隔巡检项目卡点与风险',
+        name: '项目巡检',
+        mode: 'interval',
+        intervalMinutes: 60,
+        prompt: '请巡检所有进行中项目，识别卡点和阻塞，输出最小下一步行动，并推动至少一个项目前进。',
+    },
+];
+
+const LONG_TEMPLATES: LongTemplate[] = [
+    {
+        id: 'growth-sprint',
+        label: '增长冲刺',
+        description: '围绕一个目标持续多轮优化',
+        name: '30天增长冲刺',
+        objective: '在 30 天内建立稳定的小红书内容产出节奏并提升互动率。',
+        stepPrompt: '执行一轮增长冲刺：复盘上一轮结果、调整选题策略、产出新的内容动作并落地到项目。',
+        intervalMinutes: 720,
+        totalRounds: 30,
+    },
+    {
+        id: 'ip-building',
+        label: '个人IP构建',
+        description: '持续沉淀人设与内容母题',
+        name: '个人IP构建计划',
+        objective: '建立清晰的人设定位与可复用内容母题，形成稳定输出体系。',
+        stepPrompt: '推进一轮 IP 构建：提炼用户画像、选题母题和表达风格，并输出可执行内容任务。',
+        intervalMinutes: 1440,
+        totalRounds: 21,
+    },
+    {
+        id: 'topic-lab',
+        label: '选题实验室',
+        description: '持续验证高潜选题',
+        name: '选题实验室',
+        objective: '持续验证并筛选高潜选题，形成数据驱动的选题库。',
+        stepPrompt: '执行一轮选题实验：提出 3 个选题假设，评估优先级，并推进最优选题进入创作。',
+        intervalMinutes: 480,
+        totalRounds: 20,
+    },
+];
+
+const WEEKDAY_OPTIONS = [
+    { value: 1, label: '周一' },
+    { value: 2, label: '周二' },
+    { value: 3, label: '周三' },
+    { value: 4, label: '周四' },
+    { value: 5, label: '周五' },
+    { value: 6, label: '周六' },
+    { value: 0, label: '周日' },
 ];
 
 function normalizeClawHubSlug(input: string): string {
@@ -52,6 +275,68 @@ function normalizeClawHubSlug(input: string): string {
         .toLowerCase();
 }
 
+function formatDateTime(value?: string | null): string {
+    if (!value) return '-';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '-';
+    return date.toLocaleString();
+}
+
+function pickScheduleTemplate(templateId: string): ScheduleTemplate {
+    return SCHEDULE_TEMPLATES.find((item) => item.id === templateId) || SCHEDULE_TEMPLATES[0];
+}
+
+function pickLongTemplate(templateId: string): LongTemplate {
+    return LONG_TEMPLATES.find((item) => item.id === templateId) || LONG_TEMPLATES[0];
+}
+
+function scheduleDraftFromTemplate(template: ScheduleTemplate, keepProjectId = ''): ScheduleDraft {
+    return {
+        templateId: template.id,
+        name: template.name,
+        mode: template.mode,
+        projectId: keepProjectId,
+        intervalMinutes: template.intervalMinutes || 60,
+        time: template.time || '09:00',
+        weekdays: template.weekdays || [1],
+        runAtLocal: '',
+        prompt: template.prompt,
+    };
+}
+
+function longDraftFromTemplate(template: LongTemplate, keepProjectId = ''): LongDraft {
+    return {
+        templateId: template.id,
+        name: template.name,
+        projectId: keepProjectId,
+        objective: template.objective,
+        stepPrompt: template.stepPrompt,
+        intervalMinutes: template.intervalMinutes,
+        totalRounds: template.totalRounds,
+    };
+}
+
+function modeLabel(task: RunnerScheduledTask): string {
+    if (task.mode === 'interval') return `每 ${task.intervalMinutes || 60} 分钟`;
+    if (task.mode === 'daily') return `每天 ${task.time || '--:--'}`;
+    if (task.mode === 'weekly') {
+        const weekdays = Array.isArray(task.weekdays) ? task.weekdays : [];
+        const names = weekdays
+            .map((day) => WEEKDAY_OPTIONS.find((item) => item.value === day)?.label)
+            .filter(Boolean)
+            .join('、');
+        return `${names || '每周'} ${task.time || '--:--'}`;
+    }
+    return `一次性 ${formatDateTime(task.runAt)}`;
+}
+
+function resultTone(result?: RunnerResult): string {
+    if (result === 'success') return 'text-green-600';
+    if (result === 'error') return 'text-red-500';
+    if (result === 'skipped') return 'text-amber-500';
+    return 'text-text-tertiary';
+}
+
 export function RedClaw() {
     const [sessionId, setSessionId] = useState<string | null>(null);
     const [isSessionLoading, setIsSessionLoading] = useState(true);
@@ -59,12 +344,36 @@ export function RedClaw() {
     const [chatRefreshKey, setChatRefreshKey] = useState(0);
     const [chatActionLoading, setChatActionLoading] = useState<'clear' | 'compact' | null>(null);
     const [chatActionMessage, setChatActionMessage] = useState('');
-    const [skillsOpen, setSkillsOpen] = useState(false);
+
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
+    const [sidebarTab, setSidebarTab] = useState<SidebarTab>('automation');
+
     const [skills, setSkills] = useState<SkillDefinition[]>([]);
     const [isSkillsLoading, setIsSkillsLoading] = useState(false);
-    const [statusMessage, setStatusMessage] = useState('');
+    const [skillsMessage, setSkillsMessage] = useState('');
     const [installSource, setInstallSource] = useState('');
     const [isInstallingSkill, setIsInstallingSkill] = useState(false);
+
+    const [runnerStatus, setRunnerStatus] = useState<RunnerStatus | null>(null);
+    const [automationLoading, setAutomationLoading] = useState(false);
+    const [automationMessage, setAutomationMessage] = useState('');
+    const [projects, setProjects] = useState<RedClawProjectSummary[]>([]);
+
+    const [runnerIntervalMinutes, setRunnerIntervalMinutes] = useState<number>(20);
+    const [runnerMaxAutomationPerTick, setRunnerMaxAutomationPerTick] = useState<number>(2);
+
+    const [heartbeatEnabled, setHeartbeatEnabled] = useState(true);
+    const [heartbeatIntervalMinutes, setHeartbeatIntervalMinutes] = useState<number>(30);
+    const [heartbeatSuppressEmpty, setHeartbeatSuppressEmpty] = useState(true);
+    const [heartbeatReportToMainSession, setHeartbeatReportToMainSession] = useState(true);
+
+    const [scheduleAdvanced, setScheduleAdvanced] = useState(false);
+    const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(() => scheduleDraftFromTemplate(SCHEDULE_TEMPLATES[0]));
+    const [isAddingSchedule, setIsAddingSchedule] = useState(false);
+
+    const [longAdvanced, setLongAdvanced] = useState(false);
+    const [longDraft, setLongDraft] = useState<LongDraft>(() => longDraftFromTemplate(LONG_TEMPLATES[0]));
+    const [isAddingLong, setIsAddingLong] = useState(false);
 
     const initSession = useCallback(async () => {
         setIsSessionLoading(true);
@@ -92,17 +401,42 @@ export function RedClaw() {
         }
     }, []);
 
-    useEffect(() => {
-        void initSession();
-    }, [initSession]);
+    const applyRunnerForm = useCallback((status: RunnerStatus) => {
+        setRunnerIntervalMinutes(status.intervalMinutes || 20);
+        setRunnerMaxAutomationPerTick(status.maxAutomationPerTick || 2);
+        setHeartbeatEnabled(status.heartbeat?.enabled !== false);
+        setHeartbeatIntervalMinutes(status.heartbeat?.intervalMinutes || 30);
+        setHeartbeatSuppressEmpty(status.heartbeat?.suppressEmptyReport !== false);
+        setHeartbeatReportToMainSession(status.heartbeat?.reportToMainSession !== false);
+    }, []);
 
-    useEffect(() => {
-        if (!chatActionMessage) return;
-        const timer = window.setTimeout(() => setChatActionMessage(''), 2600);
-        return () => window.clearTimeout(timer);
-    }, [chatActionMessage]);
+    const loadRunnerStatus = useCallback(async (syncForm = false) => {
+        setAutomationLoading(true);
+        try {
+            const status = await window.ipcRenderer.redclawRunner.getStatus() as RunnerStatus;
+            setRunnerStatus(status);
+            if (syncForm) {
+                applyRunnerForm(status);
+            }
+        } catch (error) {
+            console.error('Failed to load runner status:', error);
+            setAutomationMessage('加载自动化状态失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [applyRunnerForm]);
 
-    const enabledCount = useMemo(() => skills.filter((skill) => !skill.disabled).length, [skills]);
+    const loadProjects = useCallback(async () => {
+        try {
+            const list = await window.ipcRenderer.invoke('redclaw:list-projects', { limit: 60 }) as RedClawProjectSummary[];
+            if (Array.isArray(list)) {
+                setProjects(list);
+            }
+        } catch (error) {
+            console.error('Failed to load RedClaw projects:', error);
+            setProjects([]);
+        }
+    }, []);
 
     const loadSkills = useCallback(async () => {
         setIsSkillsLoading(true);
@@ -118,56 +452,77 @@ export function RedClaw() {
     }, []);
 
     useEffect(() => {
-        if (!skillsOpen) return;
+        void initSession();
+        void loadRunnerStatus(true);
+        void loadProjects();
+    }, [initSession, loadProjects, loadRunnerStatus]);
+
+    useEffect(() => {
+        const onSpaceChanged = () => {
+            void initSession();
+            void loadRunnerStatus(true);
+            void loadProjects();
+            void loadSkills();
+        };
+        window.ipcRenderer.on('space:changed', onSpaceChanged);
+        return () => {
+            window.ipcRenderer.off('space:changed', onSpaceChanged);
+        };
+    }, [initSession, loadProjects, loadRunnerStatus, loadSkills]);
+
+    useEffect(() => {
+        if (sidebarTab !== 'skills') return;
         void loadSkills();
-    }, [skillsOpen, loadSkills]);
+    }, [sidebarTab, loadSkills]);
 
-    const toggleSkill = useCallback(async (skill: SkillDefinition) => {
-        try {
-            const channel = skill.disabled ? 'skills:enable' : 'skills:disable';
-            const res = await window.ipcRenderer.invoke(channel, { name: skill.name }) as { success?: boolean; error?: string };
-            if (!res?.success) {
-                setStatusMessage(res?.error || '技能状态更新失败');
-                return;
-            }
-            setStatusMessage(skill.disabled ? `已启用技能：${skill.name}` : `已禁用技能：${skill.name}`);
-            await loadSkills();
-        } catch (error) {
-            console.error('Failed to toggle skill:', error);
-            setStatusMessage('技能状态更新失败');
-        }
-    }, [loadSkills]);
+    useEffect(() => {
+        const onRunnerStatus = (_event: unknown, status: RunnerStatus) => {
+            if (!status || typeof status !== 'object') return;
+            setRunnerStatus(status);
+        };
+        window.ipcRenderer.on('redclaw:runner-status', onRunnerStatus);
+        return () => {
+            window.ipcRenderer.off('redclaw:runner-status', onRunnerStatus);
+        };
+    }, []);
 
-    const installSkill = useCallback(async () => {
-        if (isInstallingSkill) return;
+    useEffect(() => {
+        if (!chatActionMessage) return;
+        const timer = window.setTimeout(() => setChatActionMessage(''), 2600);
+        return () => window.clearTimeout(timer);
+    }, [chatActionMessage]);
 
-        const slug = normalizeClawHubSlug(installSource);
-        if (!slug) {
-            setStatusMessage('请输入 ClawHub 技能 slug 或技能链接');
-            return;
-        }
+    useEffect(() => {
+        if (!automationMessage) return;
+        const timer = window.setTimeout(() => setAutomationMessage(''), 2800);
+        return () => window.clearTimeout(timer);
+    }, [automationMessage]);
 
-        setIsInstallingSkill(true);
-        try {
-            const result = await window.ipcRenderer.invoke('skills:market-install', { slug, tag: 'latest' }) as {
-                success?: boolean;
-                error?: string;
-                displayName?: string;
-            };
-            if (!result?.success) {
-                setStatusMessage(result?.error || '技能安装失败');
-                return;
-            }
-            setInstallSource('');
-            setStatusMessage(`已安装技能：${result.displayName || slug}`);
-            await loadSkills();
-        } catch (error) {
-            console.error('Failed to install skill:', error);
-            setStatusMessage('技能安装失败');
-        } finally {
-            setIsInstallingSkill(false);
-        }
-    }, [installSource, isInstallingSkill, loadSkills]);
+    useEffect(() => {
+        if (!skillsMessage) return;
+        const timer = window.setTimeout(() => setSkillsMessage(''), 2800);
+        return () => window.clearTimeout(timer);
+    }, [skillsMessage]);
+
+    const enabledSkillCount = useMemo(() => skills.filter((skill) => !skill.disabled).length, [skills]);
+
+    const scheduledTasks = useMemo(() => {
+        const list = Object.values(runnerStatus?.scheduledTasks || {}) as RunnerScheduledTask[];
+        return list.sort((a, b) => {
+            const aTime = a.nextRunAt ? new Date(a.nextRunAt).getTime() : Number.MAX_SAFE_INTEGER;
+            const bTime = b.nextRunAt ? new Date(b.nextRunAt).getTime() : Number.MAX_SAFE_INTEGER;
+            return aTime - bTime;
+        });
+    }, [runnerStatus]);
+
+    const longTasks = useMemo(() => {
+        const list = Object.values(runnerStatus?.longCycleTasks || {}) as RunnerLongCycleTask[];
+        return list.sort((a, b) => {
+            const aTime = a.nextRunAt ? new Date(a.nextRunAt).getTime() : Number.MAX_SAFE_INTEGER;
+            const bTime = b.nextRunAt ? new Date(b.nextRunAt).getTime() : Number.MAX_SAFE_INTEGER;
+            return aTime - bTime;
+        });
+    }, [runnerStatus]);
 
     const clearRedClawChat = useCallback(async () => {
         if (!sessionId || chatActionLoading) return;
@@ -209,90 +564,1013 @@ export function RedClaw() {
         }
     }, [chatActionLoading, sessionId]);
 
-    return (
-        <div className="h-full relative">
-            {isSessionLoading ? (
-                <div className="h-full flex items-center justify-center">
-                    <div className="flex flex-col items-center gap-3 text-text-tertiary">
-                        <Loader2 className="w-6 h-6 animate-spin" />
-                        <span className="text-xs">正在初始化 RedClaw...</span>
-                    </div>
-                </div>
-            ) : sessionId ? (
-                <>
-                    <Chat
-                        key={`${sessionId}:${chatRefreshKey}`}
-                        fixedSessionId={sessionId}
-                        defaultCollapsed={true}
-                        showClearButton={false}
-                        fixedSessionBannerText={`RedClaw 单会话（空间：${activeSpaceName}）`}
-                        shortcuts={REDCLAW_SHORTCUTS}
-                        welcomeShortcuts={REDCLAW_WELCOME_SHORTCUTS}
-                        welcomeTitle="RedClaw 创作执行台"
-                        welcomeSubtitle="围绕“目标-文案-配图-复盘”完整推进小红书创作任务"
-                        contentLayout="center-2-3"
-                    />
-                    <div className="absolute top-4 right-4 z-20 flex items-center gap-2">
-                        <button
-                            onClick={() => void clearRedClawChat()}
-                            disabled={chatActionLoading !== null}
-                            className="px-3 py-2 rounded-full border border-border bg-surface-primary/90 backdrop-blur text-text-secondary hover:text-red-500 hover:border-red-500/40 transition-colors flex items-center gap-2 disabled:opacity-60"
-                            title="清空聊天记录"
-                        >
-                            {chatActionLoading === 'clear' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
-                            <span className="text-xs">清空</span>
-                        </button>
-                        <button
-                            onClick={() => void compactRedClawContext()}
-                            disabled={chatActionLoading !== null}
-                            className="px-3 py-2 rounded-full border border-border bg-surface-primary/90 backdrop-blur text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors flex items-center gap-2 disabled:opacity-60"
-                            title="压缩上下文"
-                        >
-                            {chatActionLoading === 'compact' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Minimize2 className="w-4 h-4" />}
-                            <span className="text-xs">压缩</span>
-                        </button>
-                        <button
-                            onClick={() => setSkillsOpen(true)}
-                            className="px-3 py-2 rounded-full border border-border bg-surface-primary/90 backdrop-blur text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors flex items-center gap-2"
-                            title="技能"
-                        >
-                            <Settings2 className="w-4 h-4" />
-                            <span className="text-xs">技能</span>
-                        </button>
-                    </div>
-                    {chatActionMessage && (
-                        <div className="absolute top-16 right-4 z-20 text-xs px-3 py-2 rounded-lg border border-border bg-surface-primary/95 text-text-secondary shadow-sm">
-                            {chatActionMessage}
-                        </div>
-                    )}
-                </>
-            ) : (
-                <div className="h-full flex items-center justify-center text-text-tertiary text-sm">
-                    RedClaw 会话初始化失败
-                </div>
-            )}
+    const toggleSkill = useCallback(async (skill: SkillDefinition) => {
+        try {
+            const channel = skill.disabled ? 'skills:enable' : 'skills:disable';
+            const res = await window.ipcRenderer.invoke(channel, { name: skill.name }) as { success?: boolean; error?: string };
+            if (!res?.success) {
+                setSkillsMessage(res?.error || '技能状态更新失败');
+                return;
+            }
+            setSkillsMessage(skill.disabled ? `已启用：${skill.name}` : `已禁用：${skill.name}`);
+            await loadSkills();
+        } catch (error) {
+            console.error('Failed to toggle skill:', error);
+            setSkillsMessage('技能状态更新失败');
+        }
+    }, [loadSkills]);
 
-            {skillsOpen && (
-                <div className="fixed inset-0 z-50 bg-black/40 backdrop-blur-sm" onClick={() => setSkillsOpen(false)}>
-                    <div
-                        className="absolute right-0 top-0 h-full w-[420px] max-w-[95vw] bg-surface-primary border-l border-border flex flex-col"
-                        onClick={(event) => event.stopPropagation()}
-                    >
-                        <div className="h-14 px-4 border-b border-border flex items-center justify-between">
+    const installSkill = useCallback(async () => {
+        if (isInstallingSkill) return;
+
+        const slug = normalizeClawHubSlug(installSource);
+        if (!slug) {
+            setSkillsMessage('请输入 ClawHub 技能 slug 或技能链接');
+            return;
+        }
+
+        setIsInstallingSkill(true);
+        try {
+            const result = await window.ipcRenderer.invoke('skills:market-install', { slug, tag: 'latest' }) as {
+                success?: boolean;
+                error?: string;
+                displayName?: string;
+            };
+            if (!result?.success) {
+                setSkillsMessage(result?.error || '技能安装失败');
+                return;
+            }
+            setInstallSource('');
+            setSkillsMessage(`已安装技能：${result.displayName || slug}`);
+            await loadSkills();
+        } catch (error) {
+            console.error('Failed to install skill:', error);
+            setSkillsMessage('技能安装失败');
+        } finally {
+            setIsInstallingSkill(false);
+        }
+    }, [installSource, isInstallingSkill, loadSkills]);
+
+    const toggleRunner = useCallback(async () => {
+        if (!runnerStatus) return;
+        setAutomationLoading(true);
+        try {
+            if (runnerStatus.enabled) {
+                await window.ipcRenderer.redclawRunner.stop();
+                setAutomationMessage('后台任务已暂停');
+            } else {
+                await window.ipcRenderer.redclawRunner.start({
+                    intervalMinutes: runnerIntervalMinutes,
+                    maxAutomationPerTick: runnerMaxAutomationPerTick,
+                    heartbeatEnabled,
+                    heartbeatIntervalMinutes,
+                });
+                setAutomationMessage('后台任务已启动');
+            }
+            await loadRunnerStatus(true);
+        } catch (error) {
+            console.error('Failed to toggle runner:', error);
+            setAutomationMessage('更新后台状态失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [
+        heartbeatEnabled,
+        heartbeatIntervalMinutes,
+        loadRunnerStatus,
+        runnerIntervalMinutes,
+        runnerMaxAutomationPerTick,
+        runnerStatus,
+    ]);
+
+    const runRunnerNow = useCallback(async () => {
+        setAutomationLoading(true);
+        try {
+            await window.ipcRenderer.redclawRunner.runNow({});
+            setAutomationMessage('已触发后台立即执行');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to run runner now:', error);
+            setAutomationMessage('触发后台执行失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    const saveRunnerConfig = useCallback(async () => {
+        setAutomationLoading(true);
+        try {
+            await window.ipcRenderer.redclawRunner.setConfig({
+                intervalMinutes: runnerIntervalMinutes,
+                maxAutomationPerTick: runnerMaxAutomationPerTick,
+            });
+            setAutomationMessage('后台配置已保存');
+            await loadRunnerStatus(true);
+        } catch (error) {
+            console.error('Failed to save runner config:', error);
+            setAutomationMessage('保存后台配置失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus, runnerIntervalMinutes, runnerMaxAutomationPerTick]);
+
+    const saveHeartbeatConfig = useCallback(async () => {
+        setAutomationLoading(true);
+        try {
+            await window.ipcRenderer.redclawRunner.setConfig({
+                heartbeatEnabled,
+                heartbeatIntervalMinutes,
+                heartbeatSuppressEmptyReport: heartbeatSuppressEmpty,
+                heartbeatReportToMainSession,
+            });
+            setAutomationMessage('心跳配置已保存');
+            await loadRunnerStatus(true);
+        } catch (error) {
+            console.error('Failed to save heartbeat config:', error);
+            setAutomationMessage('保存心跳配置失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [heartbeatEnabled, heartbeatIntervalMinutes, heartbeatReportToMainSession, heartbeatSuppressEmpty, loadRunnerStatus]);
+
+    const applyScheduleTemplate = useCallback((templateId: string) => {
+        const template = pickScheduleTemplate(templateId);
+        setScheduleDraft((prev) => scheduleDraftFromTemplate(template, prev.projectId));
+    }, []);
+
+    const addScheduleTask = useCallback(async () => {
+        if (isAddingSchedule) return;
+        const draft = scheduleDraft;
+        if (!draft.prompt.trim()) {
+            setAutomationMessage('任务指令不能为空');
+            return;
+        }
+        if ((draft.mode === 'daily' || draft.mode === 'weekly') && !draft.time.trim()) {
+            setAutomationMessage('请设置执行时间');
+            return;
+        }
+        if (draft.mode === 'weekly' && draft.weekdays.length === 0) {
+            setAutomationMessage('请至少选择一个周几');
+            return;
+        }
+
+        let runAt: string | undefined;
+        if (draft.mode === 'once') {
+            const ms = new Date(draft.runAtLocal).getTime();
+            if (!Number.isFinite(ms)) {
+                setAutomationMessage('请设置一次性任务时间');
+                return;
+            }
+            runAt = new Date(ms).toISOString();
+        }
+
+        setIsAddingSchedule(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.addScheduled({
+                name: draft.name.trim() || '定时任务',
+                mode: draft.mode,
+                prompt: draft.prompt.trim(),
+                projectId: draft.projectId || undefined,
+                intervalMinutes: draft.mode === 'interval' ? draft.intervalMinutes : undefined,
+                time: draft.mode === 'daily' || draft.mode === 'weekly' ? draft.time : undefined,
+                weekdays: draft.mode === 'weekly' ? draft.weekdays : undefined,
+                runAt,
+                enabled: true,
+            });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '新增定时任务失败');
+                return;
+            }
+            setAutomationMessage('已新增定时任务');
+            applyScheduleTemplate(draft.templateId);
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to add schedule task:', error);
+            setAutomationMessage('新增定时任务失败');
+        } finally {
+            setIsAddingSchedule(false);
+        }
+    }, [applyScheduleTemplate, isAddingSchedule, loadRunnerStatus, scheduleDraft]);
+
+    const toggleScheduleTask = useCallback(async (task: RunnerScheduledTask) => {
+        setAutomationLoading(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.setScheduledEnabled({
+                taskId: task.id,
+                enabled: !task.enabled,
+            });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '更新定时任务失败');
+                return;
+            }
+            setAutomationMessage(task.enabled ? '定时任务已暂停' : '定时任务已启用');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to toggle schedule task:', error);
+            setAutomationMessage('更新定时任务失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    const runScheduleTaskNow = useCallback(async (taskId: string) => {
+        setAutomationLoading(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.runScheduledNow({ taskId });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '触发执行失败');
+                return;
+            }
+            setAutomationMessage('已触发定时任务执行');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to run schedule now:', error);
+            setAutomationMessage('触发执行失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    const removeScheduleTask = useCallback(async (taskId: string) => {
+        setAutomationLoading(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.removeScheduled({ taskId });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '删除定时任务失败');
+                return;
+            }
+            setAutomationMessage('定时任务已删除');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to remove schedule task:', error);
+            setAutomationMessage('删除定时任务失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    const applyLongTemplate = useCallback((templateId: string) => {
+        const template = pickLongTemplate(templateId);
+        setLongDraft((prev) => longDraftFromTemplate(template, prev.projectId));
+    }, []);
+
+    const addLongTask = useCallback(async () => {
+        if (isAddingLong) return;
+        const draft = longDraft;
+        if (!draft.objective.trim() || !draft.stepPrompt.trim()) {
+            setAutomationMessage('请填写长期目标与每轮指令');
+            return;
+        }
+
+        setIsAddingLong(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.addLongCycle({
+                name: draft.name.trim() || '长周期任务',
+                objective: draft.objective.trim(),
+                stepPrompt: draft.stepPrompt.trim(),
+                projectId: draft.projectId || undefined,
+                intervalMinutes: draft.intervalMinutes,
+                totalRounds: draft.totalRounds,
+                enabled: true,
+            });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '新增长周期任务失败');
+                return;
+            }
+            setAutomationMessage('已新增长周期任务');
+            applyLongTemplate(draft.templateId);
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to add long task:', error);
+            setAutomationMessage('新增长周期任务失败');
+        } finally {
+            setIsAddingLong(false);
+        }
+    }, [applyLongTemplate, isAddingLong, loadRunnerStatus, longDraft]);
+
+    const toggleLongTask = useCallback(async (task: RunnerLongCycleTask) => {
+        setAutomationLoading(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.setLongCycleEnabled({
+                taskId: task.id,
+                enabled: !task.enabled,
+            });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '更新长周期任务失败');
+                return;
+            }
+            setAutomationMessage(task.enabled ? '长周期任务已暂停' : '长周期任务已启用');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to toggle long task:', error);
+            setAutomationMessage('更新长周期任务失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    const runLongTaskNow = useCallback(async (taskId: string) => {
+        setAutomationLoading(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.runLongCycleNow({ taskId });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '触发执行失败');
+                return;
+            }
+            setAutomationMessage('已触发长周期任务执行');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to run long task now:', error);
+            setAutomationMessage('触发执行失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    const removeLongTask = useCallback(async (taskId: string) => {
+        setAutomationLoading(true);
+        try {
+            const result = await window.ipcRenderer.redclawRunner.removeLongCycle({ taskId });
+            if (!result?.success) {
+                setAutomationMessage(result?.error || '删除长周期任务失败');
+                return;
+            }
+            setAutomationMessage('长周期任务已删除');
+            await loadRunnerStatus(false);
+        } catch (error) {
+            console.error('Failed to remove long task:', error);
+            setAutomationMessage('删除长周期任务失败');
+        } finally {
+            setAutomationLoading(false);
+        }
+    }, [loadRunnerStatus]);
+
+    return (
+        <div className="h-full min-h-0 flex bg-surface-primary">
+            <div className="relative flex-1 min-w-0">
+                {isSessionLoading ? (
+                    <div className="h-full flex items-center justify-center">
+                        <div className="flex flex-col items-center gap-3 text-text-tertiary">
+                            <Loader2 className="w-6 h-6 animate-spin" />
+                            <span className="text-xs">正在初始化 RedClaw...</span>
+                        </div>
+                    </div>
+                ) : sessionId ? (
+                    <>
+                        <Chat
+                            key={`${sessionId}:${chatRefreshKey}`}
+                            fixedSessionId={sessionId}
+                            defaultCollapsed={true}
+                            showClearButton={false}
+                            fixedSessionBannerText=""
+                            showWelcomeShortcuts={false}
+                            showComposerShortcuts={false}
+                            fixedSessionContextIndicatorMode="corner-ring"
+                            shortcuts={REDCLAW_SHORTCUTS}
+                            welcomeShortcuts={REDCLAW_WELCOME_SHORTCUTS}
+                            welcomeTitle="RedClaw 创作执行台"
+                            welcomeSubtitle="围绕“目标-文案-配图-复盘”完整推进小红书创作任务"
+                            contentLayout="center-2-3"
+                        />
+                        <div className="absolute top-4 right-4 z-20 flex items-center gap-2">
+                            <button
+                                onClick={() => {
+                                    setSidebarCollapsed(false);
+                                    setSidebarTab('automation');
+                                }}
+                                className={clsx(
+                                    'px-3 py-2 rounded-full border bg-surface-primary/90 backdrop-blur text-xs transition-colors flex items-center gap-1.5',
+                                    sidebarTab === 'automation' && !sidebarCollapsed
+                                        ? 'border-accent-primary/40 text-accent-primary'
+                                        : 'border-border text-text-secondary hover:text-accent-primary hover:border-accent-primary/40'
+                                )}
+                                title="任务设置"
+                            >
+                                <Clock3 className="w-3.5 h-3.5" />
+                                任务
+                            </button>
+                            <button
+                                onClick={() => void clearRedClawChat()}
+                                disabled={chatActionLoading !== null}
+                                className="px-3 py-2 rounded-full border border-border bg-surface-primary/90 backdrop-blur text-text-secondary hover:text-red-500 hover:border-red-500/40 transition-colors flex items-center gap-2 disabled:opacity-60"
+                                title="清空聊天记录"
+                            >
+                                {chatActionLoading === 'clear' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                                <span className="text-xs">清空</span>
+                            </button>
+                            <button
+                                onClick={() => void compactRedClawContext()}
+                                disabled={chatActionLoading !== null}
+                                className="px-3 py-2 rounded-full border border-border bg-surface-primary/90 backdrop-blur text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors flex items-center gap-2 disabled:opacity-60"
+                                title="压缩上下文"
+                            >
+                                {chatActionLoading === 'compact' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Minimize2 className="w-4 h-4" />}
+                                <span className="text-xs">压缩</span>
+                            </button>
+                            <button
+                                onClick={() => setSidebarCollapsed((value) => !value)}
+                                className="px-2.5 py-2 rounded-full border border-border bg-surface-primary/90 backdrop-blur text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors"
+                                title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'}
+                            >
+                                {sidebarCollapsed ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                            </button>
+                        </div>
+                        {chatActionMessage && (
+                            <div className="absolute top-16 right-4 z-20 text-xs px-3 py-2 rounded-lg border border-border bg-surface-primary/95 text-text-secondary shadow-sm">
+                                {chatActionMessage}
+                            </div>
+                        )}
+                    </>
+                ) : (
+                    <div className="h-full flex items-center justify-center text-text-tertiary text-sm">
+                        RedClaw 会话初始化失败
+                    </div>
+                )}
+            </div>
+
+            {!sidebarCollapsed && (
+                <aside className="w-[420px] max-w-[42vw] min-w-[360px] border-l border-border bg-surface-secondary/30 flex flex-col">
+                    <div className="px-4 py-3 border-b border-border">
+                        <div className="flex items-center justify-between">
                             <div>
-                                <div className="text-sm font-semibold text-text-primary">RedClaw 技能</div>
-                                <div className="text-[11px] text-text-tertiary">已启用 {enabledCount} 个技能</div>
+                                <div className="text-sm font-semibold text-text-primary">RedClaw 侧栏</div>
+                                <div className="text-[11px] text-text-tertiary">空间：{activeSpaceName}</div>
                             </div>
                             <button
-                                onClick={() => setSkillsOpen(false)}
+                                onClick={() => setSidebarCollapsed(true)}
                                 className="p-1.5 rounded-md text-text-tertiary hover:text-text-primary hover:bg-surface-secondary"
                             >
                                 <X className="w-4 h-4" />
                             </button>
                         </div>
+                        <div className="mt-3 p-1 rounded-lg bg-surface-secondary border border-border flex gap-1">
+                            <button
+                                onClick={() => setSidebarTab('automation')}
+                                className={clsx(
+                                    'flex-1 px-2 py-1.5 rounded-md text-xs transition-colors flex items-center justify-center gap-1',
+                                    sidebarTab === 'automation'
+                                        ? 'bg-surface-primary text-text-primary border border-border'
+                                        : 'text-text-secondary hover:text-text-primary'
+                                )}
+                            >
+                                <Clock3 className="w-3.5 h-3.5" />
+                                任务
+                            </button>
+                            <button
+                                onClick={() => setSidebarTab('skills')}
+                                className={clsx(
+                                    'flex-1 px-2 py-1.5 rounded-md text-xs transition-colors flex items-center justify-center gap-1',
+                                    sidebarTab === 'skills'
+                                        ? 'bg-surface-primary text-text-primary border border-border'
+                                        : 'text-text-secondary hover:text-text-primary'
+                                )}
+                            >
+                                <Sparkles className="w-3.5 h-3.5" />
+                                技能
+                            </button>
+                        </div>
+                    </div>
 
+                    {sidebarTab === 'automation' ? (
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                            <section className="rounded-xl border border-border bg-surface-primary p-3 space-y-3">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-xs font-medium text-text-secondary flex items-center gap-1.5">
+                                        <Bot className="w-3.5 h-3.5" />
+                                        后台执行器
+                                    </div>
+                                    <span className={clsx(
+                                        'text-[10px] px-2 py-0.5 rounded-full border',
+                                        runnerStatus?.enabled
+                                            ? 'text-green-600 border-green-500/40'
+                                            : 'text-text-tertiary border-border'
+                                    )}>
+                                        {runnerStatus?.enabled ? '运行中' : '已暂停'}
+                                    </span>
+                                </div>
+
+                                <div className="text-[11px] text-text-tertiary">
+                                    上次轮询: {formatDateTime(runnerStatus?.lastTickAt)}
+                                </div>
+                                <div className="text-[11px] text-text-tertiary">
+                                    下次轮询: {formatDateTime(runnerStatus?.nextTickAt)}
+                                </div>
+
+                                <div className="space-y-1.5">
+                                    <div className="text-[11px] text-text-secondary">轮询间隔</div>
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {RUNNER_INTERVAL_OPTIONS.map((value) => (
+                                            <button
+                                                key={value}
+                                                onClick={() => setRunnerIntervalMinutes(value)}
+                                                className={clsx(
+                                                    'px-2.5 py-1 rounded-md text-[11px] border transition-colors',
+                                                    runnerIntervalMinutes === value
+                                                        ? 'border-accent-primary/40 text-accent-primary bg-accent-primary/10'
+                                                        : 'border-border text-text-tertiary hover:text-text-primary'
+                                                )}
+                                            >
+                                                {value} 分钟
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="space-y-1.5">
+                                    <div className="text-[11px] text-text-secondary">每轮任务上限</div>
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {RUNNER_MAX_AUTOMATION_OPTIONS.map((value) => (
+                                            <button
+                                                key={value}
+                                                onClick={() => setRunnerMaxAutomationPerTick(value)}
+                                                className={clsx(
+                                                    'px-2.5 py-1 rounded-md text-[11px] border transition-colors',
+                                                    runnerMaxAutomationPerTick === value
+                                                        ? 'border-accent-primary/40 text-accent-primary bg-accent-primary/10'
+                                                        : 'border-border text-text-tertiary hover:text-text-primary'
+                                                )}
+                                            >
+                                                {value}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-wrap gap-2 pt-1">
+                                    <button
+                                        onClick={() => void toggleRunner()}
+                                        disabled={automationLoading}
+                                        className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 disabled:opacity-60"
+                                    >
+                                        {runnerStatus?.enabled ? '暂停后台' : '启动后台'}
+                                    </button>
+                                    <button
+                                        onClick={() => void saveRunnerConfig()}
+                                        disabled={automationLoading}
+                                        className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 disabled:opacity-60"
+                                    >
+                                        保存参数
+                                    </button>
+                                    <button
+                                        onClick={() => void runRunnerNow()}
+                                        disabled={automationLoading}
+                                        className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 disabled:opacity-60 flex items-center gap-1"
+                                    >
+                                        <Play className="w-3 h-3" />
+                                        立即执行
+                                    </button>
+                                    <button
+                                        onClick={() => void loadRunnerStatus(false)}
+                                        className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 flex items-center gap-1"
+                                    >
+                                        <RefreshCw className={clsx('w-3 h-3', automationLoading && 'animate-spin')} />
+                                        刷新
+                                    </button>
+                                </div>
+                            </section>
+
+                            <section className="rounded-xl border border-border bg-surface-primary p-3 space-y-3">
+                                <div className="text-xs font-medium text-text-secondary">心跳设置</div>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                    <label className="text-[11px] text-text-secondary flex items-center gap-2">
+                                        <input type="checkbox" checked={heartbeatEnabled} onChange={(event) => setHeartbeatEnabled(event.target.checked)} />
+                                        启用心跳
+                                    </label>
+                                    <label className="text-[11px] text-text-secondary flex items-center gap-2">
+                                        <input type="checkbox" checked={heartbeatReportToMainSession} onChange={(event) => setHeartbeatReportToMainSession(event.target.checked)} />
+                                        写入主会话
+                                    </label>
+                                    <label className="text-[11px] text-text-secondary flex items-center gap-2 col-span-2">
+                                        <input type="checkbox" checked={heartbeatSuppressEmpty} onChange={(event) => setHeartbeatSuppressEmpty(event.target.checked)} />
+                                        无有效更新时跳过心跳汇报
+                                    </label>
+                                </div>
+
+                                <div className="space-y-1.5">
+                                    <div className="text-[11px] text-text-secondary">心跳间隔</div>
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {HEARTBEAT_INTERVAL_OPTIONS.map((value) => (
+                                            <button
+                                                key={value}
+                                                onClick={() => setHeartbeatIntervalMinutes(value)}
+                                                className={clsx(
+                                                    'px-2.5 py-1 rounded-md text-[11px] border transition-colors',
+                                                    heartbeatIntervalMinutes === value
+                                                        ? 'border-accent-primary/40 text-accent-primary bg-accent-primary/10'
+                                                        : 'border-border text-text-tertiary hover:text-text-primary'
+                                                )}
+                                            >
+                                                {value} 分钟
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="text-[11px] text-text-tertiary">上次心跳: {formatDateTime(runnerStatus?.heartbeat?.lastRunAt)}</div>
+                                <div className="text-[11px] text-text-tertiary">下次心跳: {formatDateTime(runnerStatus?.heartbeat?.nextRunAt)}</div>
+
+                                <button
+                                    onClick={() => void saveHeartbeatConfig()}
+                                    disabled={automationLoading}
+                                    className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 disabled:opacity-60"
+                                >
+                                    保存心跳设置
+                                </button>
+                            </section>
+
+                            <section className="rounded-xl border border-border bg-surface-primary p-3 space-y-3">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-xs font-medium text-text-secondary">定时任务</div>
+                                    <span className="text-[10px] text-text-tertiary">{scheduledTasks.length} 条</span>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                        模板
+                                        <select
+                                            value={scheduleDraft.templateId}
+                                            onChange={(event) => applyScheduleTemplate(event.target.value)}
+                                            className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                        >
+                                            {SCHEDULE_TEMPLATES.map((item) => (
+                                                <option key={item.id} value={item.id}>{item.label}</option>
+                                            ))}
+                                        </select>
+                                    </label>
+
+                                    <div className="text-[11px] text-text-tertiary">
+                                        {pickScheduleTemplate(scheduleDraft.templateId).description}
+                                    </div>
+
+                                    <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                        绑定项目（可选）
+                                        <select
+                                            value={scheduleDraft.projectId}
+                                            onChange={(event) => setScheduleDraft((prev) => ({ ...prev, projectId: event.target.value }))}
+                                            className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                        >
+                                            <option value="">自动选择最近项目</option>
+                                            {projects.map((project) => (
+                                                <option key={project.id} value={project.id}>
+                                                    {project.goal.slice(0, 26)}{project.goal.length > 26 ? '...' : ''}
+                                                </option>
+                                            ))}
+                                        </select>
+                                    </label>
+
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                            模式
+                                            <select
+                                                value={scheduleDraft.mode}
+                                                onChange={(event) => setScheduleDraft((prev) => ({ ...prev, mode: event.target.value as ScheduleMode }))}
+                                                className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                            >
+                                                <option value="interval">按间隔</option>
+                                                <option value="daily">每天</option>
+                                                <option value="weekly">每周</option>
+                                                <option value="once">一次性</option>
+                                            </select>
+                                        </label>
+
+                                        {scheduleDraft.mode === 'interval' && (
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                间隔（分钟）
+                                                <select
+                                                    value={scheduleDraft.intervalMinutes}
+                                                    onChange={(event) => setScheduleDraft((prev) => ({ ...prev, intervalMinutes: Number(event.target.value || 60) }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                                >
+                                                    {[15, 30, 60, 120, 240].map((value) => (
+                                                        <option key={value} value={value}>{value}</option>
+                                                    ))}
+                                                </select>
+                                            </label>
+                                        )}
+
+                                        {(scheduleDraft.mode === 'daily' || scheduleDraft.mode === 'weekly') && (
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                执行时间
+                                                <input
+                                                    type="time"
+                                                    value={scheduleDraft.time}
+                                                    onChange={(event) => setScheduleDraft((prev) => ({ ...prev, time: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                                />
+                                            </label>
+                                        )}
+
+                                        {scheduleDraft.mode === 'once' && (
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1 col-span-2">
+                                                执行时间
+                                                <input
+                                                    type="datetime-local"
+                                                    value={scheduleDraft.runAtLocal}
+                                                    onChange={(event) => setScheduleDraft((prev) => ({ ...prev, runAtLocal: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                                />
+                                            </label>
+                                        )}
+                                    </div>
+
+                                    {scheduleDraft.mode === 'weekly' && (
+                                        <div className="space-y-1.5">
+                                            <div className="text-[11px] text-text-secondary">执行日</div>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {WEEKDAY_OPTIONS.map((item) => {
+                                                    const selected = scheduleDraft.weekdays.includes(item.value);
+                                                    return (
+                                                        <button
+                                                            key={item.value}
+                                                            onClick={() => {
+                                                                setScheduleDraft((prev) => {
+                                                                    const next = new Set(prev.weekdays);
+                                                                    if (next.has(item.value)) {
+                                                                        next.delete(item.value);
+                                                                    } else {
+                                                                        next.add(item.value);
+                                                                    }
+                                                                    return { ...prev, weekdays: Array.from(next.values()) };
+                                                                });
+                                                            }}
+                                                            className={clsx(
+                                                                'px-2 py-1 rounded-md text-[11px] border transition-colors flex items-center gap-1',
+                                                                selected
+                                                                    ? 'border-accent-primary/40 text-accent-primary bg-accent-primary/10'
+                                                                    : 'border-border text-text-tertiary hover:text-text-primary'
+                                                            )}
+                                                        >
+                                                            {selected && <Check className="w-3 h-3" />}
+                                                            {item.label}
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="flex items-center justify-between">
+                                        <button
+                                            onClick={() => setScheduleAdvanced((value) => !value)}
+                                            className="text-[11px] text-text-tertiary hover:text-text-primary"
+                                        >
+                                            {scheduleAdvanced ? '收起高级设置' : '展开高级设置'}
+                                        </button>
+                                        <button
+                                            onClick={() => void addScheduleTask()}
+                                            disabled={isAddingSchedule}
+                                            className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 disabled:opacity-60"
+                                        >
+                                            {isAddingSchedule ? '创建中...' : '新增任务'}
+                                        </button>
+                                    </div>
+
+                                    {scheduleAdvanced && (
+                                        <>
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                任务名称
+                                                <input
+                                                    value={scheduleDraft.name}
+                                                    onChange={(event) => setScheduleDraft((prev) => ({ ...prev, name: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                                />
+                                            </label>
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                执行指令
+                                                <textarea
+                                                    rows={3}
+                                                    value={scheduleDraft.prompt}
+                                                    onChange={(event) => setScheduleDraft((prev) => ({ ...prev, prompt: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs resize-y"
+                                                />
+                                            </label>
+                                        </>
+                                    )}
+                                </div>
+
+                                <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
+                                    {scheduledTasks.length === 0 ? (
+                                        <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-lg p-3">
+                                            还没有定时任务
+                                        </div>
+                                    ) : scheduledTasks.map((task) => (
+                                        <div key={task.id} className="rounded-lg border border-border bg-surface-secondary/40 p-2.5 space-y-1.5">
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="text-xs text-text-primary truncate">{task.name}</div>
+                                                <span className={clsx(
+                                                    'text-[10px] px-1.5 py-0.5 rounded border',
+                                                    task.enabled
+                                                        ? 'text-green-600 border-green-500/40'
+                                                        : 'text-text-tertiary border-border'
+                                                )}>
+                                                    {task.enabled ? '启用' : '暂停'}
+                                                </span>
+                                            </div>
+                                            <div className="text-[11px] text-text-tertiary">{modeLabel(task)}</div>
+                                            <div className="text-[11px] text-text-tertiary">下次: {formatDateTime(task.nextRunAt)}</div>
+                                            <div className={clsx('text-[11px]', resultTone(task.lastResult))}>
+                                                最近结果: {task.lastResult || '-'}
+                                            </div>
+                                            <div className="flex items-center gap-1.5 pt-1">
+                                                <button
+                                                    onClick={() => void runScheduleTaskNow(task.id)}
+                                                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 flex items-center gap-1"
+                                                >
+                                                    <Play className="w-3 h-3" /> 立即
+                                                </button>
+                                                <button
+                                                    onClick={() => void toggleScheduleTask(task)}
+                                                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-accent-primary hover:border-accent-primary/40"
+                                                >
+                                                    {task.enabled ? '暂停' : '启用'}
+                                                </button>
+                                                <button
+                                                    onClick={() => void removeScheduleTask(task.id)}
+                                                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-red-500 hover:border-red-500/40"
+                                                >
+                                                    删除
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+
+                            <section className="rounded-xl border border-border bg-surface-primary p-3 space-y-3">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-xs font-medium text-text-secondary">长周期任务</div>
+                                    <span className="text-[10px] text-text-tertiary">{longTasks.length} 条</span>
+                                </div>
+
+                                <div className="space-y-2">
+                                    <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                        模板
+                                        <select
+                                            value={longDraft.templateId}
+                                            onChange={(event) => applyLongTemplate(event.target.value)}
+                                            className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                        >
+                                            {LONG_TEMPLATES.map((item) => (
+                                                <option key={item.id} value={item.id}>{item.label}</option>
+                                            ))}
+                                        </select>
+                                    </label>
+
+                                    <div className="text-[11px] text-text-tertiary">
+                                        {pickLongTemplate(longDraft.templateId).description}
+                                    </div>
+
+                                    <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                        绑定项目（可选）
+                                        <select
+                                            value={longDraft.projectId}
+                                            onChange={(event) => setLongDraft((prev) => ({ ...prev, projectId: event.target.value }))}
+                                            className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                        >
+                                            <option value="">自动选择最近项目</option>
+                                            {projects.map((project) => (
+                                                <option key={project.id} value={project.id}>
+                                                    {project.goal.slice(0, 26)}{project.goal.length > 26 ? '...' : ''}
+                                                </option>
+                                            ))}
+                                        </select>
+                                    </label>
+
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                            间隔（分钟）
+                                            <select
+                                                value={longDraft.intervalMinutes}
+                                                onChange={(event) => setLongDraft((prev) => ({ ...prev, intervalMinutes: Number(event.target.value || 60) }))}
+                                                className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                            >
+                                                {[60, 180, 480, 720, 1440].map((value) => (
+                                                    <option key={value} value={value}>{value}</option>
+                                                ))}
+                                            </select>
+                                        </label>
+                                        <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                            总轮次
+                                            <select
+                                                value={longDraft.totalRounds}
+                                                onChange={(event) => setLongDraft((prev) => ({ ...prev, totalRounds: Number(event.target.value || 8) }))}
+                                                className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                            >
+                                                {[7, 14, 21, 30, 60].map((value) => (
+                                                    <option key={value} value={value}>{value}</option>
+                                                ))}
+                                            </select>
+                                        </label>
+                                    </div>
+
+                                    <div className="flex items-center justify-between">
+                                        <button
+                                            onClick={() => setLongAdvanced((value) => !value)}
+                                            className="text-[11px] text-text-tertiary hover:text-text-primary"
+                                        >
+                                            {longAdvanced ? '收起高级设置' : '展开高级设置'}
+                                        </button>
+                                        <button
+                                            onClick={() => void addLongTask()}
+                                            disabled={isAddingLong}
+                                            className="px-3 py-1.5 rounded-md border border-border text-xs text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 disabled:opacity-60"
+                                        >
+                                            {isAddingLong ? '创建中...' : '新增任务'}
+                                        </button>
+                                    </div>
+
+                                    {longAdvanced && (
+                                        <>
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                任务名称
+                                                <input
+                                                    value={longDraft.name}
+                                                    onChange={(event) => setLongDraft((prev) => ({ ...prev, name: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs"
+                                                />
+                                            </label>
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                长期目标
+                                                <textarea
+                                                    rows={2}
+                                                    value={longDraft.objective}
+                                                    onChange={(event) => setLongDraft((prev) => ({ ...prev, objective: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs resize-y"
+                                                />
+                                            </label>
+                                            <label className="text-[11px] text-text-secondary flex flex-col gap-1">
+                                                每轮指令
+                                                <textarea
+                                                    rows={2}
+                                                    value={longDraft.stepPrompt}
+                                                    onChange={(event) => setLongDraft((prev) => ({ ...prev, stepPrompt: event.target.value }))}
+                                                    className="px-2 py-1.5 rounded-md border border-border bg-surface-secondary text-xs resize-y"
+                                                />
+                                            </label>
+                                        </>
+                                    )}
+                                </div>
+
+                                <div className="space-y-2 max-h-[260px] overflow-y-auto pr-1">
+                                    {longTasks.length === 0 ? (
+                                        <div className="text-[11px] text-text-tertiary border border-dashed border-border rounded-lg p-3">
+                                            还没有长周期任务
+                                        </div>
+                                    ) : longTasks.map((task) => (
+                                        <div key={task.id} className="rounded-lg border border-border bg-surface-secondary/40 p-2.5 space-y-1.5">
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="text-xs text-text-primary truncate">{task.name}</div>
+                                                <span className={clsx(
+                                                    'text-[10px] px-1.5 py-0.5 rounded border',
+                                                    task.status === 'completed'
+                                                        ? 'text-green-600 border-green-500/40'
+                                                        : task.enabled
+                                                            ? 'text-accent-primary border-accent-primary/40'
+                                                            : 'text-text-tertiary border-border'
+                                                )}>
+                                                    {task.status}
+                                                </span>
+                                            </div>
+                                            <div className="text-[11px] text-text-tertiary">轮次: {task.completedRounds}/{task.totalRounds}</div>
+                                            <div className="text-[11px] text-text-tertiary">下次: {formatDateTime(task.nextRunAt)}</div>
+                                            <div className={clsx('text-[11px]', resultTone(task.lastResult))}>
+                                                最近结果: {task.lastResult || '-'}
+                                            </div>
+                                            <div className="flex items-center gap-1.5 pt-1">
+                                                <button
+                                                    onClick={() => void runLongTaskNow(task.id)}
+                                                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 flex items-center gap-1"
+                                                >
+                                                    <Play className="w-3 h-3" /> 立即
+                                                </button>
+                                                <button
+                                                    onClick={() => void toggleLongTask(task)}
+                                                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-accent-primary hover:border-accent-primary/40"
+                                                >
+                                                    {task.enabled ? '暂停' : '启用'}
+                                                </button>
+                                                <button
+                                                    onClick={() => void removeLongTask(task.id)}
+                                                    className="px-2 py-1 rounded border border-border text-[11px] text-text-secondary hover:text-red-500 hover:border-red-500/40"
+                                                >
+                                                    删除
+                                                </button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </section>
+
+                            {automationMessage && (
+                                <div className="text-xs px-3 py-2 rounded-lg border border-border bg-surface-primary text-text-secondary">
+                                    {automationMessage}
+                                </div>
+                            )}
+                        </div>
+                    ) : (
                         <div className="flex-1 overflow-y-auto p-4 space-y-3">
-                            <div className="border border-border rounded-lg p-3 bg-surface-secondary/40 space-y-2">
+                            <div className="rounded-xl border border-border bg-surface-primary p-3 space-y-2">
                                 <div className="text-xs text-text-secondary font-medium">安装技能</div>
                                 <input
                                     type="text"
@@ -304,17 +1582,19 @@ export function RedClaw() {
                                         }
                                     }}
                                     placeholder="输入 skill slug 或 ClawHub 链接"
-                                    className="w-full px-3 py-2 rounded-md border border-border bg-surface-primary text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent-primary"
+                                    className="w-full px-3 py-2 rounded-md border border-border bg-surface-secondary text-xs text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent-primary"
                                 />
                                 <button
                                     onClick={() => void installSkill()}
                                     disabled={isInstallingSkill || !installSource.trim()}
-                                    className="w-full px-3 py-2 rounded-md text-xs border border-border bg-surface-primary text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-60 flex items-center justify-center gap-2"
+                                    className="w-full px-3 py-2 rounded-md text-xs border border-border bg-surface-secondary text-text-secondary hover:text-accent-primary hover:border-accent-primary/40 transition-colors disabled:opacity-60 flex items-center justify-center gap-2"
                                 >
                                     {isInstallingSkill ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
                                     <span>{isInstallingSkill ? '安装中...' : '安装技能'}</span>
                                 </button>
                             </div>
+
+                            <div className="text-[11px] text-text-tertiary">已启用 {enabledSkillCount} 个技能</div>
 
                             {isSkillsLoading ? (
                                 <div className="text-xs text-text-tertiary flex items-center gap-2">
@@ -327,8 +1607,8 @@ export function RedClaw() {
                                 </div>
                             ) : (
                                 skills.map((skill) => (
-                                    <div key={skill.location} className="border border-border rounded-lg p-3 bg-surface-secondary/40">
-                                        <div className="flex items-start justify-between gap-3">
+                                    <div key={skill.location} className="rounded-xl border border-border bg-surface-primary p-3">
+                                        <div className="flex items-start justify-between gap-2">
                                             <div className="min-w-0">
                                                 <div className="text-sm text-text-primary font-medium truncate">{skill.name}</div>
                                                 <div className="text-xs text-text-tertiary mt-1 line-clamp-2">{skill.description || '无描述'}</div>
@@ -349,15 +1629,15 @@ export function RedClaw() {
                                     </div>
                                 ))
                             )}
-                        </div>
 
-                        {statusMessage && (
-                            <div className="px-4 py-3 border-t border-border text-xs text-text-secondary bg-surface-secondary/40">
-                                {statusMessage}
-                            </div>
-                        )}
-                    </div>
-                </div>
+                            {skillsMessage && (
+                                <div className="text-xs px-3 py-2 rounded-lg border border-border bg-surface-primary text-text-secondary">
+                                    {skillsMessage}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </aside>
             )}
         </div>
     );

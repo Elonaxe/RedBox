@@ -79,7 +79,7 @@ class StdioJsonRpcClient {
       },
       clientInfo: {
         name: 'RedConvert',
-        version: '1.7.2',
+        version: '1.7.3',
       },
     });
 
@@ -324,7 +324,7 @@ export async function listMcpTools(server: McpServerConfig): Promise<McpToolInfo
     params: {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      clientInfo: { name: 'RedConvert', version: '1.7.2' },
+      clientInfo: { name: 'RedConvert', version: '1.7.3' },
     },
   }, headers);
   const sessionHeader = init.sessionId ? { ...headers, 'mcp-session-id': init.sessionId } : headers;
@@ -363,7 +363,7 @@ export async function callMcpTool(
     params: {
       protocolVersion: MCP_PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      clientInfo: { name: 'RedConvert', version: '1.7.2' },
+      clientInfo: { name: 'RedConvert', version: '1.7.3' },
     },
   }, headers);
   const sessionHeader = init.sessionId ? { ...headers, 'mcp-session-id': init.sessionId } : headers;

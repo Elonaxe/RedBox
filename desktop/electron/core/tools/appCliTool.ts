@@ -233,6 +233,11 @@ function helpText(): string {
         '- redclaw runner-status',
         '- redclaw runner-start --interval 20',
         '- redclaw runner-enable-project --project-id rc_xxx',
+        '- redclaw heartbeat-set --enabled true --interval 30',
+        '- redclaw schedule-add --name "每日复盘" --mode daily --time 21:30 --prompt "汇总今天任务进展"',
+        '- redclaw schedule-update --task-id sched_xxx --time 20:30 --enabled true',
+        '- redclaw long-add --name "30天IP实验" --objective "建立稳定选题方法" --step-prompt "推进一轮实验并产出结论" --rounds 30',
+        '- redclaw long-update --task-id long_xxx --interval 720 --rounds 21',
         '- media list --limit 100',
         '- media bind --asset-id media_xxx --manuscript-path "redclaw/rc_xxx.md"',
         '- image generate --prompt "..." --project-id rc_xxx --count 2',
@@ -769,6 +774,9 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 intervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
                 keepAliveWhenNoWindow: parseBoolean(readFlag(parsed.flags, 'keep-alive') || payload.keepAliveWhenNoWindow),
                 maxProjectsPerTick: parseNumber(readFlag(parsed.flags, 'max-projects', 'max-projects-per-tick') || payload.maxProjectsPerTick),
+                maxAutomationPerTick: parseNumber(readFlag(parsed.flags, 'max-automation', 'max-automation-per-tick') || payload.maxAutomationPerTick),
+                heartbeatEnabled: parseBoolean(readFlag(parsed.flags, 'heartbeat-enabled') || payload.heartbeatEnabled),
+                heartbeatIntervalMinutes: parseNumber(readFlag(parsed.flags, 'heartbeat-interval') || payload.heartbeatIntervalMinutes),
             });
         }
         if (action === 'runner-stop') {
@@ -786,6 +794,12 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 intervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
                 keepAliveWhenNoWindow: parseBoolean(readFlag(parsed.flags, 'keep-alive') || payload.keepAliveWhenNoWindow),
                 maxProjectsPerTick: parseNumber(readFlag(parsed.flags, 'max-projects', 'max-projects-per-tick') || payload.maxProjectsPerTick),
+                maxAutomationPerTick: parseNumber(readFlag(parsed.flags, 'max-automation', 'max-automation-per-tick') || payload.maxAutomationPerTick),
+                heartbeatEnabled: parseBoolean(readFlag(parsed.flags, 'heartbeat-enabled') || payload.heartbeatEnabled),
+                heartbeatIntervalMinutes: parseNumber(readFlag(parsed.flags, 'heartbeat-interval') || payload.heartbeatIntervalMinutes),
+                heartbeatSuppressEmptyReport: parseBoolean(readFlag(parsed.flags, 'heartbeat-suppress-empty') || payload.heartbeatSuppressEmptyReport),
+                heartbeatReportToMainSession: parseBoolean(readFlag(parsed.flags, 'heartbeat-report-main') || payload.heartbeatReportToMainSession),
+                heartbeatPrompt: (readFlag(parsed.flags, 'heartbeat-prompt') || payload.heartbeatPrompt) as string | undefined,
             });
         }
         if (action === 'runner-enable-project' || action === 'runner-disable-project' || action === 'runner-set-project') {
@@ -808,6 +822,143 @@ export class AppCliTool extends DeclarativeTool<typeof AppCliParamsSchema> {
                 enabled,
                 prompt: readFlag(parsed.flags, 'prompt') || (payload.prompt as string | undefined),
             });
+        }
+        if (action === 'heartbeat-status') {
+            const runner = await getRunner();
+            const status = runner.getStatus();
+            return {
+                enabled: status.heartbeat?.enabled ?? false,
+                intervalMinutes: status.heartbeat?.intervalMinutes ?? null,
+                nextRunAt: status.heartbeat?.nextRunAt || null,
+                lastRunAt: status.heartbeat?.lastRunAt || null,
+                suppressEmptyReport: status.heartbeat?.suppressEmptyReport ?? true,
+                reportToMainSession: status.heartbeat?.reportToMainSession ?? true,
+                hasCustomPrompt: Boolean(status.heartbeat?.prompt),
+            };
+        }
+        if (action === 'heartbeat-set') {
+            const runner = await getRunner();
+            return runner.setRunnerConfig({
+                heartbeatEnabled: parseBoolean(readFlag(parsed.flags, 'enabled') || payload.enabled),
+                heartbeatIntervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
+                heartbeatSuppressEmptyReport: parseBoolean(readFlag(parsed.flags, 'suppress-empty') || payload.suppressEmptyReport),
+                heartbeatReportToMainSession: parseBoolean(readFlag(parsed.flags, 'report-main') || payload.reportToMainSession),
+                heartbeatPrompt: (readFlag(parsed.flags, 'prompt') || payload.prompt) as string | undefined,
+            });
+        }
+        if (action === 'schedule-list') {
+            const runner = await getRunner();
+            const tasks = runner.listScheduledTasks();
+            return { count: tasks.length, tasks };
+        }
+        if (action === 'schedule-add') {
+            const runner = await getRunner();
+            const mode = String(readFlag(parsed.flags, 'mode') || payload.mode || 'interval').trim().toLowerCase();
+            const weekdays = parseList(readFlag(parsed.flags, 'weekdays') || payload.weekdays)
+                .map((item) => Number(item))
+                .filter((n) => Number.isFinite(n))
+                .map((n) => Math.max(0, Math.min(6, Math.floor(n))));
+
+            return runner.addScheduledTask({
+                name: requireString(readFlag(parsed.flags, 'name') || payload.name, 'name'),
+                mode: mode as 'interval' | 'daily' | 'weekly' | 'once',
+                prompt: requireString(readFlag(parsed.flags, 'prompt') || payload.prompt, 'prompt'),
+                projectId: readFlag(parsed.flags, 'project-id', 'projectid') || (payload.projectId as string | undefined),
+                intervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
+                time: (readFlag(parsed.flags, 'time') || payload.time) as string | undefined,
+                weekdays,
+                runAt: (readFlag(parsed.flags, 'run-at', 'at') || payload.runAt) as string | undefined,
+                enabled: parseBoolean(readFlag(parsed.flags, 'enabled') || payload.enabled),
+            });
+        }
+        if (action === 'schedule-update' || action === 'schedule-edit') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            const modeRaw = readFlag(parsed.flags, 'mode') || (payload.mode as string | undefined);
+            const mode = modeRaw ? String(modeRaw).trim().toLowerCase() as 'interval' | 'daily' | 'weekly' | 'once' : undefined;
+            const weekdaysInput = readFlag(parsed.flags, 'weekdays') ?? payload.weekdays;
+            const weekdays = weekdaysInput !== undefined
+                ? parseList(weekdaysInput)
+                    .map((item) => Number(item))
+                    .filter((n) => Number.isFinite(n))
+                    .map((n) => Math.max(0, Math.min(6, Math.floor(n))))
+                : undefined;
+            const clearProject = parseBoolean(readFlag(parsed.flags, 'clear-project') || payload.clearProject) === true;
+            const projectIdRaw = readFlag(parsed.flags, 'project-id', 'projectid') || (payload.projectId as string | undefined);
+
+            return runner.updateScheduledTask(taskId, {
+                name: (readFlag(parsed.flags, 'name') || payload.name) as string | undefined,
+                mode,
+                prompt: (readFlag(parsed.flags, 'prompt') || payload.prompt) as string | undefined,
+                projectId: clearProject ? null : projectIdRaw,
+                intervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
+                time: (readFlag(parsed.flags, 'time') || payload.time) as string | undefined,
+                weekdays,
+                runAt: (readFlag(parsed.flags, 'run-at', 'at') || payload.runAt) as string | undefined,
+                enabled: parseBoolean(readFlag(parsed.flags, 'enabled') || payload.enabled),
+            });
+        }
+        if (action === 'schedule-remove') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            return runner.removeScheduledTask(taskId);
+        }
+        if (action === 'schedule-enable' || action === 'schedule-disable') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            return runner.setScheduledTaskEnabled(taskId, action === 'schedule-enable');
+        }
+        if (action === 'schedule-run-now') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            return runner.runScheduledTaskNow(taskId);
+        }
+        if (action === 'long-list') {
+            const runner = await getRunner();
+            const tasks = runner.listLongCycleTasks();
+            return { count: tasks.length, tasks };
+        }
+        if (action === 'long-add') {
+            const runner = await getRunner();
+            return runner.addLongCycleTask({
+                name: requireString(readFlag(parsed.flags, 'name') || payload.name, 'name'),
+                objective: requireString(readFlag(parsed.flags, 'objective') || payload.objective, 'objective'),
+                stepPrompt: requireString(readFlag(parsed.flags, 'step-prompt') || payload.stepPrompt, 'stepPrompt'),
+                projectId: readFlag(parsed.flags, 'project-id', 'projectid') || (payload.projectId as string | undefined),
+                intervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
+                totalRounds: parseNumber(readFlag(parsed.flags, 'rounds', 'total-rounds') || payload.totalRounds),
+                enabled: parseBoolean(readFlag(parsed.flags, 'enabled') || payload.enabled),
+            });
+        }
+        if (action === 'long-update' || action === 'long-edit') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            const clearProject = parseBoolean(readFlag(parsed.flags, 'clear-project') || payload.clearProject) === true;
+            const projectIdRaw = readFlag(parsed.flags, 'project-id', 'projectid') || (payload.projectId as string | undefined);
+            return runner.updateLongCycleTask(taskId, {
+                name: (readFlag(parsed.flags, 'name') || payload.name) as string | undefined,
+                objective: (readFlag(parsed.flags, 'objective') || payload.objective) as string | undefined,
+                stepPrompt: (readFlag(parsed.flags, 'step-prompt') || payload.stepPrompt) as string | undefined,
+                projectId: clearProject ? null : projectIdRaw,
+                intervalMinutes: parseNumber(readFlag(parsed.flags, 'interval', 'interval-minutes') || payload.intervalMinutes),
+                totalRounds: parseNumber(readFlag(parsed.flags, 'rounds', 'total-rounds') || payload.totalRounds),
+                enabled: parseBoolean(readFlag(parsed.flags, 'enabled') || payload.enabled),
+            });
+        }
+        if (action === 'long-remove') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            return runner.removeLongCycleTask(taskId);
+        }
+        if (action === 'long-enable' || action === 'long-disable') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            return runner.setLongCycleTaskEnabled(taskId, action === 'long-enable');
+        }
+        if (action === 'long-run-now') {
+            const runner = await getRunner();
+            const taskId = requireString(readFlag(parsed.flags, 'task-id', 'taskid') || payload.taskId, 'taskId');
+            return runner.runLongCycleTaskNow(taskId);
         }
         throw new Error(`Unsupported redclaw action: ${action}`);
     }

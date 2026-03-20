@@ -33,10 +33,17 @@ function App() {
   const [pendingChatMessage, setPendingChatMessage] = useState<PendingChatMessage | null>(null);
   const [pendingManuscriptFile, setPendingManuscriptFile] = useState<string | null>(null);
   const [xhsBrowserInitialized, setXhsBrowserInitialized] = useState(false);
+  const [wanderInitialized, setWanderInitialized] = useState(false);
 
   useEffect(() => {
     if (currentView === 'xhs-browser') {
       setXhsBrowserInitialized(true);
+    }
+  }, [currentView]);
+
+  useEffect(() => {
+    if (currentView === 'wander') {
+      setWanderInitialized(true);
     }
   }, [currentView]);
 
@@ -83,7 +90,11 @@ function App() {
           />
         )}
         {currentView === 'archives' && <Archives />}
-        {currentView === 'wander' && <Wander onNavigateToManuscript={navigateToManuscript} />}
+        {wanderInitialized && (
+          <div className={currentView === 'wander' ? 'h-full min-h-0 flex flex-col' : 'hidden'}>
+            <Wander onNavigateToManuscript={navigateToManuscript} />
+          </div>
+        )}
         {currentView === 'redclaw' && <RedClaw />}
         {currentView === 'media-library' && <MediaLibrary />}
         {currentView === 'image-gen' && <ImageGen />}

@@ -1,6 +1,6 @@
 {
   "name": "red-convert-desktop",
-  "version": "1.7.2",
+  "version": "1.7.5",
   "repository": {
     "type": "git",
     "url": "https://github.com/Jamailar/RedConver-Private.git"
@@ -19,7 +19,7 @@
     "preview": "vite preview"
   },
   "build": {
-    "productName": "红盒子",
+    "productName": "RedBox",
     "artifactName": "RedBox-${version}-${arch}.${ext}",
     "appId": "com.redbox.app",
     "directories": {
@@ -60,6 +60,8 @@
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "extendInfo": {
+        "CFBundleDisplayName": "RedBox",
+        "CFBundleName": "RedBox",
         "NSCameraUsageDescription": "This app requires camera access to record videos."
       },
       "notarize": {

@@ -67,11 +67,56 @@ contextBridge.exposeInMainWorld('ipcRenderer', {
 
   redclawRunner: {
     getStatus: () => ipcRenderer.invoke('redclaw:runner-status'),
-    start: (payload?: { intervalMinutes?: number; keepAliveWhenNoWindow?: boolean; maxProjectsPerTick?: number }) => ipcRenderer.invoke('redclaw:runner-start', payload || {}),
+    start: (payload?: {
+      intervalMinutes?: number;
+      keepAliveWhenNoWindow?: boolean;
+      maxProjectsPerTick?: number;
+      maxAutomationPerTick?: number;
+      heartbeatEnabled?: boolean;
+      heartbeatIntervalMinutes?: number;
+    }) => ipcRenderer.invoke('redclaw:runner-start', payload || {}),
     stop: () => ipcRenderer.invoke('redclaw:runner-stop'),
     runNow: (payload?: { projectId?: string }) => ipcRenderer.invoke('redclaw:runner-run-now', payload || {}),
     setProject: (payload: { projectId: string; enabled: boolean; prompt?: string }) => ipcRenderer.invoke('redclaw:runner-set-project', payload),
-    setConfig: (payload: { intervalMinutes?: number; keepAliveWhenNoWindow?: boolean; maxProjectsPerTick?: number }) => ipcRenderer.invoke('redclaw:runner-set-config', payload || {}),
+    setConfig: (payload: {
+      intervalMinutes?: number;
+      keepAliveWhenNoWindow?: boolean;
+      maxProjectsPerTick?: number;
+      maxAutomationPerTick?: number;
+      heartbeatEnabled?: boolean;
+      heartbeatIntervalMinutes?: number;
+      heartbeatSuppressEmptyReport?: boolean;
+      heartbeatReportToMainSession?: boolean;
+      heartbeatPrompt?: string;
+    }) => ipcRenderer.invoke('redclaw:runner-set-config', payload || {}),
+    listScheduled: () => ipcRenderer.invoke('redclaw:runner-list-scheduled'),
+    addScheduled: (payload: {
+      name: string;
+      mode: 'interval' | 'daily' | 'weekly' | 'once';
+      prompt: string;
+      projectId?: string;
+      intervalMinutes?: number;
+      time?: string;
+      weekdays?: number[];
+      runAt?: string;
+      enabled?: boolean;
+    }) => ipcRenderer.invoke('redclaw:runner-add-scheduled', payload),
+    removeScheduled: (payload: { taskId: string }) => ipcRenderer.invoke('redclaw:runner-remove-scheduled', payload),
+    setScheduledEnabled: (payload: { taskId: string; enabled: boolean }) => ipcRenderer.invoke('redclaw:runner-set-scheduled-enabled', payload),
+    runScheduledNow: (payload: { taskId: string }) => ipcRenderer.invoke('redclaw:runner-run-scheduled-now', payload),
+    listLongCycle: () => ipcRenderer.invoke('redclaw:runner-list-long-cycle'),
+    addLongCycle: (payload: {
+      name: string;
+      objective: string;
+      stepPrompt: string;
+      projectId?: string;
+      intervalMinutes?: number;
+      totalRounds?: number;
+      enabled?: boolean;
+    }) => ipcRenderer.invoke('redclaw:runner-add-long-cycle', payload),
+    removeLongCycle: (payload: { taskId: string }) => ipcRenderer.invoke('redclaw:runner-remove-long-cycle', payload),
+    setLongCycleEnabled: (payload: { taskId: string; enabled: boolean }) => ipcRenderer.invoke('redclaw:runner-set-long-cycle-enabled', payload),
+    runLongCycleNow: (payload: { taskId: string }) => ipcRenderer.invoke('redclaw:runner-run-long-cycle-now', payload),
   },
 
   // Skills

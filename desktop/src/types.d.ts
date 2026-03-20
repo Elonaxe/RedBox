@@ -99,11 +99,60 @@ declare global {
           intervalMinutes: number;
           keepAliveWhenNoWindow: boolean;
           maxProjectsPerTick: number;
+          maxAutomationPerTick?: number;
           isTicking: boolean;
           currentProjectId: string | null;
+          currentAutomationTaskId?: string | null;
           lastTickAt: string | null;
           nextTickAt: string | null;
+          nextMaintenanceAt?: string | null;
           lastError: string | null;
+          heartbeat?: {
+            enabled: boolean;
+            intervalMinutes: number;
+            suppressEmptyReport: boolean;
+            reportToMainSession: boolean;
+            prompt?: string;
+            lastRunAt?: string;
+            nextRunAt?: string;
+            lastDigest?: string;
+          };
+          scheduledTasks?: Record<string, {
+            id: string;
+            name: string;
+            enabled: boolean;
+            mode: 'interval' | 'daily' | 'weekly' | 'once';
+            prompt: string;
+            projectId?: string;
+            intervalMinutes?: number;
+            time?: string;
+            weekdays?: number[];
+            runAt?: string;
+            createdAt: string;
+            updatedAt: string;
+            lastRunAt?: string;
+            lastResult?: 'success' | 'error' | 'skipped';
+            lastError?: string;
+            nextRunAt?: string;
+          }>;
+          longCycleTasks?: Record<string, {
+            id: string;
+            name: string;
+            enabled: boolean;
+            status: 'running' | 'paused' | 'completed';
+            objective: string;
+            stepPrompt: string;
+            projectId?: string;
+            intervalMinutes: number;
+            totalRounds: number;
+            completedRounds: number;
+            createdAt: string;
+            updatedAt: string;
+            lastRunAt?: string;
+            lastResult?: 'success' | 'error' | 'skipped';
+            lastError?: string;
+            nextRunAt?: string;
+          }>;
           projectStates: Record<string, {
             projectId: string;
             enabled: boolean;
@@ -113,11 +162,98 @@ declare global {
             lastError?: string;
           }>;
         }>;
-        start: (payload?: { intervalMinutes?: number; keepAliveWhenNoWindow?: boolean; maxProjectsPerTick?: number }) => Promise<unknown>;
+        start: (payload?: {
+          intervalMinutes?: number;
+          keepAliveWhenNoWindow?: boolean;
+          maxProjectsPerTick?: number;
+          maxAutomationPerTick?: number;
+          heartbeatEnabled?: boolean;
+          heartbeatIntervalMinutes?: number;
+        }) => Promise<unknown>;
         stop: () => Promise<unknown>;
         runNow: (payload?: { projectId?: string }) => Promise<unknown>;
         setProject: (payload: { projectId: string; enabled: boolean; prompt?: string }) => Promise<unknown>;
-        setConfig: (payload: { intervalMinutes?: number; keepAliveWhenNoWindow?: boolean; maxProjectsPerTick?: number }) => Promise<unknown>;
+        setConfig: (payload: {
+          intervalMinutes?: number;
+          keepAliveWhenNoWindow?: boolean;
+          maxProjectsPerTick?: number;
+          maxAutomationPerTick?: number;
+          heartbeatEnabled?: boolean;
+          heartbeatIntervalMinutes?: number;
+          heartbeatSuppressEmptyReport?: boolean;
+          heartbeatReportToMainSession?: boolean;
+          heartbeatPrompt?: string;
+        }) => Promise<unknown>;
+        listScheduled: () => Promise<{
+          success: boolean;
+          error?: string;
+          tasks: Array<{
+            id: string;
+            name: string;
+            enabled: boolean;
+            mode: 'interval' | 'daily' | 'weekly' | 'once';
+            prompt: string;
+            projectId?: string;
+            intervalMinutes?: number;
+            time?: string;
+            weekdays?: number[];
+            runAt?: string;
+            createdAt: string;
+            updatedAt: string;
+            lastRunAt?: string;
+            lastResult?: 'success' | 'error' | 'skipped';
+            lastError?: string;
+            nextRunAt?: string;
+          }>;
+        }>;
+        addScheduled: (payload: {
+          name: string;
+          mode: 'interval' | 'daily' | 'weekly' | 'once';
+          prompt: string;
+          projectId?: string;
+          intervalMinutes?: number;
+          time?: string;
+          weekdays?: number[];
+          runAt?: string;
+          enabled?: boolean;
+        }) => Promise<{ success: boolean; error?: string }>;
+        removeScheduled: (payload: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
+        setScheduledEnabled: (payload: { taskId: string; enabled: boolean }) => Promise<{ success: boolean; error?: string }>;
+        runScheduledNow: (payload: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
+        listLongCycle: () => Promise<{
+          success: boolean;
+          error?: string;
+          tasks: Array<{
+            id: string;
+            name: string;
+            enabled: boolean;
+            status: 'running' | 'paused' | 'completed';
+            objective: string;
+            stepPrompt: string;
+            projectId?: string;
+            intervalMinutes: number;
+            totalRounds: number;
+            completedRounds: number;
+            createdAt: string;
+            updatedAt: string;
+            lastRunAt?: string;
+            lastResult?: 'success' | 'error' | 'skipped';
+            lastError?: string;
+            nextRunAt?: string;
+          }>;
+        }>;
+        addLongCycle: (payload: {
+          name: string;
+          objective: string;
+          stepPrompt: string;
+          projectId?: string;
+          intervalMinutes?: number;
+          totalRounds?: number;
+          enabled?: boolean;
+        }) => Promise<{ success: boolean; error?: string }>;
+        removeLongCycle: (payload: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
+        setLongCycleEnabled: (payload: { taskId: string; enabled: boolean }) => Promise<{ success: boolean; error?: string }>;
+        runLongCycleNow: (payload: { taskId: string }) => Promise<{ success: boolean; error?: string }>;
       };
       mcp: {
         list: () => Promise<{ success: boolean; servers: Array<{

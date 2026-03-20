@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { CheckCircle2, ChevronDown, ChevronRight, Copy, Check, Loader2, Wrench, XCircle } from 'lucide-react';
+import { clsx } from 'clsx';
 
 // --- Types ---
 
@@ -178,6 +179,7 @@ const formatTime = (timestamp: number): string => {
 interface ProcessTimelineProps {
   items: ProcessItem[];
   isStreaming?: boolean;
+  variant?: 'default' | 'compact';
 }
 
 type TimelineFilter = 'all' | 'running' | 'failed' | 'done' | 'tool';
@@ -190,21 +192,23 @@ const FILTER_LABELS: Record<TimelineFilter, string> = {
   tool: '仅工具',
 };
 
-export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
+export function ProcessTimeline({ items, isStreaming, variant = 'default' }: ProcessTimelineProps) {
   if (!items || items.length === 0) return null;
 
+  const isCompact = variant === 'compact';
+  const timelineItems = isCompact ? items.slice(-8) : items;
   const hasRunningItem = items.some(item => item.status === 'running');
-  const statusText = getStatusText(items);
-  const [expanded, setExpanded] = useState(true);
+  const statusText = getStatusText(timelineItems);
+  const [expanded, setExpanded] = useState(!isCompact);
   const [filter, setFilter] = useState<TimelineFilter>('all');
   const [search, setSearch] = useState('');
   const [expandAllOutputs, setExpandAllOutputs] = useState(false);
   const [copiedDiagnosticId, setCopiedDiagnosticId] = useState<string | null>(null);
-  const runningCount = items.filter(item => item.status === 'running').length;
-  const failedCount = items.filter(item => item.status === 'failed').length;
-  const doneCount = items.filter(item => item.status === 'done').length;
+  const runningCount = timelineItems.filter(item => item.status === 'running').length;
+  const failedCount = timelineItems.filter(item => item.status === 'failed').length;
+  const doneCount = timelineItems.filter(item => item.status === 'done').length;
   const normalizedSearch = search.trim().toLowerCase();
-  const filteredItems = items.filter(item => {
+  const filteredItems = timelineItems.filter(item => {
     if (filter === 'running' && item.status !== 'running') return false;
     if (filter === 'failed' && item.status !== 'failed') return false;
     if (filter === 'done' && item.status !== 'done') return false;
@@ -290,9 +294,20 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
   }, [hasRunningItem]);
 
   return (
-    <div className="my-2 w-full max-w-3xl rounded-xl border border-border bg-surface-secondary/40 overflow-hidden animate-in fade-in duration-200">
-      <div className="px-3 py-2 border-b border-border/70 flex items-center justify-between gap-3">
-        <div className="min-w-0 flex items-center gap-2 text-sm text-text-secondary">
+    <div className={clsx(
+      'w-full overflow-hidden animate-in fade-in duration-200',
+      isCompact
+        ? 'mt-2 max-w-[760px] rounded-lg border border-border/60 bg-surface-secondary/20'
+        : 'my-2 max-w-3xl rounded-xl border border-border bg-surface-secondary/40',
+    )}>
+      <div className={clsx(
+        'flex items-center justify-between gap-3',
+        isCompact ? 'px-2.5 py-1.5 border-b border-border/60' : 'px-3 py-2 border-b border-border/70',
+      )}>
+        <div className={clsx(
+          'min-w-0 flex items-center gap-2 text-text-secondary',
+          isCompact ? 'text-xs' : 'text-sm',
+        )}>
           {hasRunningItem || isStreaming ? (
             <Loader2 className="w-3.5 h-3.5 animate-spin text-accent-primary shrink-0" />
           ) : (
@@ -301,17 +316,17 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
           <span className="truncate">{statusText}</span>
         </div>
         <div className="shrink-0 flex items-center gap-2">
-          {runningCount > 0 && (
+          {!isCompact && runningCount > 0 && (
             <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-500">
               {runningCount} 运行中
             </span>
           )}
-          {doneCount > 0 && (
+          {!isCompact && doneCount > 0 && (
             <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-green-500/10 text-green-500">
               {doneCount} 完成
             </span>
           )}
-          {failedCount > 0 && (
+          {!isCompact && failedCount > 0 && (
             <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-red-500/10 text-red-500">
               {failedCount} 失败
             </span>
@@ -319,17 +334,21 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
           <button
             type="button"
             onClick={() => setExpanded(prev => !prev)}
-            className="inline-flex items-center gap-1 text-xs text-text-tertiary hover:text-text-primary transition-colors"
+            className={clsx(
+              'inline-flex items-center gap-1 text-text-tertiary hover:text-text-primary transition-colors',
+              isCompact ? 'text-[11px]' : 'text-xs',
+            )}
           >
             {expanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-            <span>{expanded ? '收起过程' : `查看过程 (${items.length})`}</span>
+            <span>{expanded ? '收起' : `过程 (${timelineItems.length})`}</span>
           </button>
         </div>
       </div>
 
       {expanded && (
-        <div className="p-3 space-y-2">
-          <div className="rounded-lg border border-border/70 bg-surface-primary/60 p-2 flex items-center gap-2 flex-wrap">
+        <div className={clsx(isCompact ? 'p-2 space-y-1.5' : 'p-3 space-y-2')}>
+          {!isCompact && (
+            <div className="rounded-lg border border-border/70 bg-surface-primary/60 p-2 flex items-center gap-2 flex-wrap">
             {(Object.keys(FILTER_LABELS) as TimelineFilter[]).map(key => (
               <button
                 key={key}
@@ -369,9 +388,10 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
               </span>
             )}
             <span className="text-[11px] text-text-tertiary px-1">
-              {filteredItems.length}/{items.length}
+              {filteredItems.length}/{timelineItems.length}
             </span>
-          </div>
+            </div>
+          )}
 
           {filteredItems.map(item => {
             const inputText = item.type === 'tool-call' ? truncateText(stringifyValue(item.toolData?.input)) : '';
@@ -389,30 +409,42 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
             const timeText = formatTime(item.timestamp);
 
             return (
-              <div key={item.id} className="rounded-lg border border-border/80 bg-surface-primary/70 overflow-hidden">
-                <div className="px-3 py-2 flex items-start justify-between gap-3">
+              <div key={item.id} className={clsx(
+                'rounded-lg border border-border/80 bg-surface-primary/70 overflow-hidden',
+                isCompact && 'bg-surface-primary/60',
+              )}>
+                <div className={clsx(
+                  'flex items-start justify-between gap-3',
+                  isCompact ? 'px-2.5 py-1.5' : 'px-3 py-2',
+                )}>
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       {isTool ? (
-                        <Wrench className="w-3.5 h-3.5 text-accent-primary shrink-0" />
+                        <Wrench className={clsx(isCompact ? 'w-3 h-3' : 'w-3.5 h-3.5', 'text-accent-primary shrink-0')} />
                       ) : (
-                        <div className="w-3.5 h-3.5 rounded-full bg-text-tertiary/60 shrink-0" />
+                        <div className={clsx(isCompact ? 'w-3 h-3' : 'w-3.5 h-3.5', 'rounded-full bg-text-tertiary/60 shrink-0')} />
                       )}
-                      <span className="text-xs font-mono text-text-primary truncate">
+                      <span className={clsx(
+                        'font-mono text-text-primary truncate',
+                        isCompact ? 'text-[11px]' : 'text-xs',
+                      )}>
                         {isTool ? `${toolDisplayLabel} (${toolName})` : title}
                       </span>
                     </div>
-                    {subtitle && (
+                    {!isCompact && subtitle && (
                       <div className="mt-1 text-xs text-text-tertiary whitespace-pre-wrap break-words">
                         {subtitle}
                       </div>
                     )}
                     {toolSummary && (
-                      <div className="mt-1 text-xs font-mono text-accent-primary/90 truncate">
+                      <div className={clsx(
+                        'mt-1 font-mono text-accent-primary/90 truncate',
+                        isCompact ? 'text-[11px]' : 'text-xs',
+                      )}>
                         {toolSummary}
                       </div>
                     )}
-                    {toolCallId && (
+                    {!isCompact && toolCallId && (
                       <div className="mt-1 text-[11px] font-mono text-text-tertiary/90 truncate">
                         callId: {toolCallId}
                       </div>
@@ -420,10 +452,10 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
                   </div>
 
                   <div className="shrink-0 flex items-center gap-2">
-                    {timeText && (
+                    {!isCompact && timeText && (
                       <span className="text-[11px] text-text-tertiary">{timeText}</span>
                     )}
-                    {durationText && (
+                    {!isCompact && durationText && (
                       <span className="text-[11px] text-text-tertiary">{durationText}</span>
                     )}
                     {item.status === 'running' && (
@@ -444,7 +476,7 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
                         失败
                       </span>
                     )}
-                    {isTool && item.status === 'failed' && (
+                    {!isCompact && isTool && item.status === 'failed' && (
                       <button
                         type="button"
                         onClick={() => void handleCopyDiagnostic(item)}
@@ -466,7 +498,7 @@ export function ProcessTimeline({ items, isStreaming }: ProcessTimelineProps) {
                   </div>
                 </div>
 
-                {isTool && (inputText || outputText) && (
+                {isTool && !isCompact && (inputText || outputText) && (
                   <details className="border-t border-border/70 px-3 py-2" open={expandAllOutputs || item.status === 'running' || item.status === 'failed'}>
                     <summary className="text-xs text-text-tertiary cursor-pointer select-none">
                       查看参数与输出

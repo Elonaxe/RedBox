@@ -56,6 +56,7 @@ export class DiscussionFlowService extends EventEmitter {
     private config: DiscussionConfig;
     private win: BrowserWindow | null;
     private abortController: AbortController | null = null;
+    private currentRoomId: string | null = null;
 
     constructor(config: DiscussionConfig, win: BrowserWindow | null = null) {
         super();
@@ -78,6 +79,7 @@ export class DiscussionFlowService extends EventEmitter {
         fileContext?: { filePath: string; fileContent: string }
     ): Promise<DiscussionMessage[]> {
         this.abortController = new AbortController();
+        this.currentRoomId = roomId;
         const newMessages: DiscussionMessage[] = [];
         const conversationHistory: ConversationMessage[] = [];
 
@@ -257,6 +259,7 @@ export class DiscussionFlowService extends EventEmitter {
             throw error;
         } finally {
             this.abortController = null;
+            this.currentRoomId = null;
         }
     }
 
@@ -475,6 +478,8 @@ export class DiscussionFlowService extends EventEmitter {
             case 'response_chunk':
                 this.sendToFrontend('creative-chat:stream', {
                     advisorId: event.advisorId,
+                    advisorName: event.advisorName,
+                    advisorAvatar: event.advisorAvatar,
                     content: event.content,
                     done: false,
                 });
@@ -483,6 +488,8 @@ export class DiscussionFlowService extends EventEmitter {
             case 'response_end':
                 this.sendToFrontend('creative-chat:stream', {
                     advisorId: event.advisorId,
+                    advisorName: event.advisorName,
+                    advisorAvatar: event.advisorAvatar,
                     content: '',
                     done: true,
                 });
@@ -498,7 +505,8 @@ export class DiscussionFlowService extends EventEmitter {
      * 发送消息到前端
      */
     private sendToFrontend(channel: string, data: any): void {
-        this.win?.webContents.send(channel, data);
+        const payload = this.currentRoomId ? { ...data, roomId: this.currentRoomId } : data;
+        this.win?.webContents.send(channel, payload);
     }
 
     /**

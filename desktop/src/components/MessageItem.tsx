@@ -51,6 +51,8 @@ interface MessageItemProps {
   msg: Message;
   copiedMessageId: string | null;
   onCopyMessage: (id: string, content: string) => void;
+  workflowPlacement?: 'top' | 'bottom';
+  workflowVariant?: 'default' | 'compact';
 }
 
 const MARKDOWN_COMPONENTS: Components = {
@@ -96,8 +98,17 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
-export const MessageItem = memo(({ msg, copiedMessageId, onCopyMessage }: MessageItemProps) => {
+export const MessageItem = memo(({
+  msg,
+  copiedMessageId,
+  onCopyMessage,
+  workflowPlacement = 'top',
+  workflowVariant = 'default',
+}: MessageItemProps) => {
   const isUser = msg.role === 'user';
+  const showTimeline = !isUser && msg.timeline && msg.timeline.length > 0;
+  const showLegacyWorkflow = !isUser && (!msg.timeline || msg.timeline.length === 0) && (msg.thinking || msg.tools.length > 0 || msg.activatedSkill);
+  const showWorkflowOnTop = workflowPlacement === 'top';
 
   return (
     <div className={clsx("flex flex-col", isUser ? "items-end" : "items-start")}>
@@ -108,12 +119,12 @@ export const MessageItem = memo(({ msg, copiedMessageId, onCopyMessage }: Messag
       )}
 
       {/* AI 工作流可视化 (新版 Timeline) */}
-      {!isUser && msg.timeline && msg.timeline.length > 0 && (
-        <ProcessTimeline items={msg.timeline} isStreaming={!!msg.isStreaming} />
+      {showWorkflowOnTop && showTimeline && (
+        <ProcessTimeline items={msg.timeline} isStreaming={!!msg.isStreaming} variant={workflowVariant} />
       )}
 
       {/* AI 工作流可视化 (兼容旧版：思考、工具、技能) - 仅当 timeline 为空时显示 */}
-      {!isUser && (!msg.timeline || msg.timeline.length === 0) && (msg.thinking || msg.tools.length > 0 || msg.activatedSkill) && (
+      {showWorkflowOnTop && showLegacyWorkflow && (
         <div className="mb-4 w-full max-w-3xl space-y-3">
           {/* Thinking Bubble */}
           {msg.thinking && (
@@ -227,6 +238,34 @@ export const MessageItem = memo(({ msg, copiedMessageId, onCopyMessage }: Messag
           </div>
         )
       )}
+
+      {/* AI 工作流可视化 (底部渲染) */}
+      {!showWorkflowOnTop && showTimeline && (
+        <ProcessTimeline items={msg.timeline} isStreaming={!!msg.isStreaming} variant={workflowVariant} />
+      )}
+
+      {!showWorkflowOnTop && showLegacyWorkflow && (
+        <div className="mt-3 w-full max-w-3xl space-y-3">
+          {msg.thinking && (
+            <ThinkingBubble content={msg.thinking} isActive={!!msg.isStreaming && !msg.content} />
+          )}
+          {msg.activatedSkill && (
+            <SkillActivatedBadge
+              name={msg.activatedSkill.name}
+              description={msg.activatedSkill.description}
+            />
+          )}
+          {msg.tools.length > 0 && (
+            <div className="bg-surface-secondary/50 rounded-lg border border-border overflow-hidden">
+              <div className="px-3 py-2 bg-surface-secondary border-b border-border/50 flex items-center justify-between">
+                <div className="flex items-center text-xs text-text-tertiary font-medium">
+                  Tool Calls ({msg.tools.length})
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }, (prevProps, nextProps) => {
@@ -248,6 +287,9 @@ export const MessageItem = memo(({ msg, copiedMessageId, onCopyMessage }: Messag
 
   const copyStatusChanged = 
     (prevProps.copiedMessageId === prevProps.msg.id) !== (nextProps.copiedMessageId === nextProps.msg.id);
+  const workflowStyleChanged =
+    prevProps.workflowPlacement !== nextProps.workflowPlacement ||
+    prevProps.workflowVariant !== nextProps.workflowVariant;
 
-  return !msgChanged && !copyStatusChanged;
+  return !msgChanged && !copyStatusChanged && !workflowStyleChanged;
 });

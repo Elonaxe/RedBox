@@ -189,6 +189,8 @@ async function ensureWorkspaceStructureFor(paths: ReturnType<typeof getWorkspace
     paths.manuscripts,
     paths.media,
     paths.redclaw,
+    path.join(paths.redclaw, 'profile'),
+    path.join(paths.base, 'memory'),
     path.join(paths.base, 'archives'),
     path.join(paths.base, 'chatrooms'),
   ];
@@ -253,6 +255,9 @@ async function initializeRedClawBackgroundRunner() {
     });
     runner.on('log', (log) => {
       win?.webContents.send('redclaw:runner-log', log);
+    });
+    runner.on('message', (payload) => {
+      win?.webContents.send('redclaw:runner-message', payload);
     });
     redClawRunnerListenersAttached = true;
   }
@@ -707,6 +712,9 @@ ipcMain.handle('redclaw:runner-start', async (_, payload: {
   intervalMinutes?: number;
   keepAliveWhenNoWindow?: boolean;
   maxProjectsPerTick?: number;
+  maxAutomationPerTick?: number;
+  heartbeatEnabled?: boolean;
+  heartbeatIntervalMinutes?: number;
 } = {}) => {
   try {
     return await getRedClawBackgroundRunner().start(payload);
@@ -747,9 +755,123 @@ ipcMain.handle('redclaw:runner-set-config', async (_, payload: {
   intervalMinutes?: number;
   keepAliveWhenNoWindow?: boolean;
   maxProjectsPerTick?: number;
+  maxAutomationPerTick?: number;
+  heartbeatEnabled?: boolean;
+  heartbeatIntervalMinutes?: number;
+  heartbeatSuppressEmptyReport?: boolean;
+  heartbeatReportToMainSession?: boolean;
+  heartbeatPrompt?: string;
 } = {}) => {
   try {
     return await getRedClawBackgroundRunner().setRunnerConfig(payload);
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-list-scheduled', async () => {
+  try {
+    const tasks = getRedClawBackgroundRunner().listScheduledTasks();
+    return { success: true, tasks };
+  } catch (error) {
+    return { success: false, error: String(error), tasks: [] };
+  }
+});
+
+ipcMain.handle('redclaw:runner-add-scheduled', async (_, payload: {
+  name: string;
+  mode: 'interval' | 'daily' | 'weekly' | 'once';
+  prompt: string;
+  projectId?: string;
+  intervalMinutes?: number;
+  time?: string;
+  weekdays?: number[];
+  runAt?: string;
+  enabled?: boolean;
+}) => {
+  try {
+    const task = await getRedClawBackgroundRunner().addScheduledTask(payload);
+    return { success: true, task };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-remove-scheduled', async (_, payload: { taskId: string }) => {
+  try {
+    const status = await getRedClawBackgroundRunner().removeScheduledTask(payload?.taskId || '');
+    return { success: true, status };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-set-scheduled-enabled', async (_, payload: { taskId: string; enabled: boolean }) => {
+  try {
+    const task = await getRedClawBackgroundRunner().setScheduledTaskEnabled(payload?.taskId || '', Boolean(payload?.enabled));
+    return { success: true, task };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-run-scheduled-now', async (_, payload: { taskId: string }) => {
+  try {
+    const status = await getRedClawBackgroundRunner().runScheduledTaskNow(payload?.taskId || '');
+    return { success: true, status };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-list-long-cycle', async () => {
+  try {
+    const tasks = getRedClawBackgroundRunner().listLongCycleTasks();
+    return { success: true, tasks };
+  } catch (error) {
+    return { success: false, error: String(error), tasks: [] };
+  }
+});
+
+ipcMain.handle('redclaw:runner-add-long-cycle', async (_, payload: {
+  name: string;
+  objective: string;
+  stepPrompt: string;
+  projectId?: string;
+  intervalMinutes?: number;
+  totalRounds?: number;
+  enabled?: boolean;
+}) => {
+  try {
+    const task = await getRedClawBackgroundRunner().addLongCycleTask(payload);
+    return { success: true, task };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-remove-long-cycle', async (_, payload: { taskId: string }) => {
+  try {
+    const status = await getRedClawBackgroundRunner().removeLongCycleTask(payload?.taskId || '');
+    return { success: true, status };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-set-long-cycle-enabled', async (_, payload: { taskId: string; enabled: boolean }) => {
+  try {
+    const task = await getRedClawBackgroundRunner().setLongCycleTaskEnabled(payload?.taskId || '', Boolean(payload?.enabled));
+    return { success: true, task };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+});
+
+ipcMain.handle('redclaw:runner-run-long-cycle-now', async (_, payload: { taskId: string }) => {
+  try {
+    const status = await getRedClawBackgroundRunner().runLongCycleTaskNow(payload?.taskId || '');
+    return { success: true, status };
   } catch (error) {
     return { success: false, error: String(error) };
   }
@@ -2227,6 +2349,7 @@ function getChatroomsDir() {
 // ========== 六顶思考帽系统聊天室 ==========
 const SIX_HATS_ROOM_ID = 'system_six_thinking_hats';
 const SIX_HATS_ROOM_NAME = '六顶思考帽';
+const SYSTEM_ROOMS_STATE_FILE = '.system_rooms_state.json';
 
 // 六顶思考帽角色定义（增强版：支持工具调用和深度思考）
 const SIX_THINKING_HATS = [
@@ -2435,9 +2558,22 @@ async function ensureSixHatsRoom() {
   const fs = require('fs/promises');
   const roomsDir = getChatroomsDir();
   const roomPath = path.join(roomsDir, `${SIX_HATS_ROOM_ID}.json`);
+  const statePath = path.join(roomsDir, SYSTEM_ROOMS_STATE_FILE);
 
   try {
     await fs.mkdir(roomsDir, { recursive: true });
+
+    // 如果用户已显式删除系统群，则不再自动重建
+    try {
+      const stateRaw = await fs.readFile(statePath, 'utf-8');
+      const state = JSON.parse(stateRaw) as { disabledRoomIds?: string[] };
+      const disabled = Array.isArray(state?.disabledRoomIds) ? state.disabledRoomIds : [];
+      if (disabled.includes(SIX_HATS_ROOM_ID)) {
+        return;
+      }
+    } catch {
+      // ignore state parse/read errors
+    }
 
     // 检查是否已存在
     try {
@@ -2556,10 +2692,40 @@ ipcMain.handle('chatrooms:update', async (_, { roomId, name, advisorIds }: { roo
 
 ipcMain.handle('chatrooms:delete', async (_, roomId: string) => {
   const fs = require('fs/promises');
-  const roomPath = path.join(getChatroomsDir(), `${roomId}.json`);
+  const roomsDir = getChatroomsDir();
+  const roomPath = path.join(roomsDir, `${roomId}.json`);
+  const statePath = path.join(roomsDir, SYSTEM_ROOMS_STATE_FILE);
 
   try {
-    await fs.unlink(roomPath);
+    await fs.mkdir(roomsDir, { recursive: true });
+
+    if (roomId === SIX_HATS_ROOM_ID) {
+      let disabledRoomIds: string[] = [];
+      try {
+        const stateRaw = await fs.readFile(statePath, 'utf-8');
+        const state = JSON.parse(stateRaw) as { disabledRoomIds?: string[] };
+        disabledRoomIds = Array.isArray(state?.disabledRoomIds) ? state.disabledRoomIds : [];
+      } catch {
+        // ignore read/parse error
+      }
+      if (!disabledRoomIds.includes(SIX_HATS_ROOM_ID)) {
+        disabledRoomIds.push(SIX_HATS_ROOM_ID);
+      }
+      await fs.writeFile(
+        statePath,
+        JSON.stringify({ disabledRoomIds }, null, 2),
+        'utf-8'
+      );
+    }
+
+    try {
+      await fs.unlink(roomPath);
+    } catch (error: unknown) {
+      const code = (error as { code?: string })?.code;
+      if (code !== 'ENOENT') {
+        throw error;
+      }
+    }
     return { success: true };
   } catch (error) {
     console.error('Failed to delete chatroom:', error);
@@ -2583,7 +2749,7 @@ ipcMain.handle('chatrooms:clear', async (_, roomId: string) => {
   }
 });
 
-ipcMain.handle('chatrooms:send', async (_, { roomId, message, context }: { roomId: string; message: string; context?: { filePath: string; fileContent: string } }) => {
+ipcMain.handle('chatrooms:send', async (_, { roomId, message, context, clientMessageId }: { roomId: string; message: string; context?: { filePath: string; fileContent: string }; clientMessageId?: string }) => {
   const fs = require('fs/promises');
   const roomPath = path.join(getChatroomsDir(), `${roomId}.json`);
   const { createDiscussionFlowService, DIRECTOR_ID } = await import('./core/director');
@@ -2594,7 +2760,13 @@ ipcMain.handle('chatrooms:send', async (_, { roomId, message, context }: { roomI
     const room = JSON.parse(roomContent);
 
     // Add user message
-    const userMsg = { id: `msg_${Date.now()}`, role: 'user', content: message, timestamp: new Date().toISOString() };
+    const safeClientMessageId = typeof clientMessageId === 'string' && clientMessageId.trim() ? clientMessageId.trim() : '';
+    const userMsg = {
+      id: safeClientMessageId || `msg_${Date.now()}`,
+      role: 'user',
+      content: message,
+      timestamp: new Date().toISOString()
+    };
     room.messages.push(userMsg);
 
     // 通知前端有新的用户消息（用于从其他页面发送消息的场景）
@@ -2606,7 +2778,7 @@ ipcMain.handle('chatrooms:send', async (_, { roomId, message, context }: { roomI
     // Get settings
     const settings = getSettings() as { api_endpoint?: string; api_key?: string; model_name?: string; embedding_endpoint?: string; embedding_key?: string; embedding_model?: string } | undefined;
     if (!settings?.api_endpoint || !settings?.api_key || !settings?.model_name) {
-      win?.webContents.send('creative-chat:done');
+      win?.webContents.send('creative-chat:done', { roomId });
       return { success: false, error: 'API not configured' };
     }
 
@@ -2652,7 +2824,7 @@ ipcMain.handle('chatrooms:send', async (_, { roomId, message, context }: { roomI
     }
 
     if (advisorInfos.length === 0) {
-      win?.webContents.send('creative-chat:done');
+      win?.webContents.send('creative-chat:done', { roomId });
       return { success: false, error: 'No valid advisors in room' };
     }
 
@@ -2695,12 +2867,12 @@ ipcMain.handle('chatrooms:send', async (_, { roomId, message, context }: { roomI
 
     // Save room
     await fs.writeFile(roomPath, JSON.stringify(room, null, 2), 'utf-8');
-    win?.webContents.send('creative-chat:done');
+    win?.webContents.send('creative-chat:done', { roomId });
     return { success: true };
 
   } catch (error) {
     console.error('Failed to send message:', error);
-    win?.webContents.send('creative-chat:done');
+    win?.webContents.send('creative-chat:done', { roomId });
     return { success: false, error: String(error) };
   }
 });
@@ -3988,6 +4160,125 @@ import http from 'http'
 const HTTP_PORT = 23456;
 let httpServer: http.Server | null = null;
 
+async function persistXhsNote(note: any): Promise<{ success: boolean; noteId?: string; error?: string }> {
+  const fs = require('fs/promises');
+  try {
+    const noteId = note?.noteId || `note_${Date.now()}`;
+    const noteDir = path.join(getKnowledgeRedbookDir(), noteId);
+    await fs.mkdir(noteDir, { recursive: true });
+
+    const noteContent = note?.content || note?.text || note?.noteText || '';
+    const meta: {
+      title: string;
+      author: string;
+      content: string;
+      stats: { likes: number; collects?: number };
+      images: string[];
+      cover?: string;
+      video?: string;
+      videoUrl?: string;
+      transcript?: string;
+      transcriptFile?: string;
+      createdAt: string;
+    } = {
+      title: note?.title || '无标题',
+      author: note?.author || '未知',
+      content: noteContent || '',
+      stats: note?.stats || { likes: 0, collects: 0 },
+      images: [],
+      createdAt: new Date().toISOString(),
+    };
+
+    if (note?.coverUrl && typeof note.coverUrl === 'string') {
+      const imagesDir = path.join(noteDir, 'images');
+      await fs.mkdir(imagesDir, { recursive: true });
+      const coverPath = path.join(imagesDir, 'cover.jpg');
+      try {
+        if (note.coverUrl.startsWith('data:image')) {
+          const base64Data = note.coverUrl.split(',')[1];
+          await fs.writeFile(coverPath, Buffer.from(base64Data, 'base64'));
+        } else if (note.coverUrl.startsWith('http')) {
+          await downloadImageToFile(note.coverUrl, coverPath);
+        }
+        meta.cover = 'images/cover.jpg';
+        meta.images.push(meta.cover);
+      } catch (error) {
+        console.error('Failed to download cover:', error);
+      }
+    }
+
+    if (Array.isArray(note?.images)) {
+      const imagesDir = path.join(noteDir, 'images');
+      await fs.mkdir(imagesDir, { recursive: true });
+
+      for (let i = 0; i < note.images.length; i++) {
+        const imgData = note.images[i];
+        if (!imgData || typeof imgData !== 'string') continue;
+        const imgPath = path.join(imagesDir, `${i}.jpg`);
+        if (imgData.startsWith('data:image')) {
+          const base64Data = imgData.split(',')[1];
+          await fs.writeFile(imgPath, Buffer.from(base64Data, 'base64'));
+          meta.images.push(`images/${i}.jpg`);
+        } else if (imgData.startsWith('http')) {
+          try {
+            await downloadImageToFile(imgData, imgPath);
+            meta.images.push(`images/${i}.jpg`);
+          } catch (error) {
+            console.error('Failed to download image:', error);
+            meta.images.push(imgData);
+          }
+        }
+      }
+    }
+
+    if (note?.videoUrl && typeof note.videoUrl === 'string') {
+      try {
+        const videoName = 'video.mp4';
+        const videoPath = path.join(noteDir, videoName);
+        await downloadFile(note.videoUrl, videoPath);
+        meta.video = videoName;
+        meta.videoUrl = note.videoUrl;
+      } catch (error) {
+        console.error('Failed to download video:', error);
+      }
+    }
+
+    const metaPath = path.join(noteDir, 'meta.json');
+    await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    await fs.writeFile(path.join(noteDir, 'content.md'), noteContent || '');
+
+    indexManager.addToQueue(normalizeNote(noteId, meta, noteContent || ''));
+    win?.webContents.send('knowledge:new-note', { noteId, title: meta.title });
+
+    if (meta.video) {
+      (async () => {
+        const videoPath = path.join(noteDir, meta.video as string);
+        const transcript = await transcribeVideoToText(videoPath);
+        if (transcript) {
+          meta.transcript = transcript;
+          meta.transcriptFile = 'transcript.txt';
+          await fs.writeFile(path.join(noteDir, meta.transcriptFile), transcript);
+          await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+          indexManager.addToQueue(normalizeVideo(
+            noteId,
+            meta,
+            transcript,
+            'user'
+          ));
+          win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true });
+        }
+      })().catch((err) => {
+        console.error('Failed to transcribe video:', err);
+      });
+    }
+
+    return { success: true, noteId };
+  } catch (error) {
+    console.error('Failed to save note:', error);
+    return { success: false, error: String(error) };
+  }
+}
+
 function startHttpServer() {
   const fs = require('fs/promises');
 
@@ -4050,116 +4341,12 @@ function startHttpServer() {
       req.on('end', async () => {
         try {
           const note = JSON.parse(body);
-          const noteId = note.noteId || `note_${Date.now()}`;
-          const noteDir = path.join(getKnowledgeRedbookDir(), noteId);
-
-          await fs.mkdir(noteDir, { recursive: true });
-
-          // Save meta.json
-          const noteContent = note.content || note.text || note.noteText || '';
-          const meta: { title: string; author: string; content: string; stats: { likes: number; collects?: number }; images: string[]; cover?: string; video?: string; videoUrl?: string; transcript?: string; transcriptFile?: string; createdAt: string } = {
-            title: note.title || '无标题',
-            author: note.author || '未知',
-            content: noteContent || '',
-            stats: note.stats || { likes: 0, collects: 0 },
-            images: [],
-            createdAt: new Date().toISOString(),
-          };
-
-          // Save cover if provided
-          if (note.coverUrl && typeof note.coverUrl === 'string') {
-            const imagesDir = path.join(noteDir, 'images');
-            await fs.mkdir(imagesDir, { recursive: true });
-            const coverPath = path.join(imagesDir, 'cover.jpg');
-            try {
-              if (note.coverUrl.startsWith('data:image')) {
-                const base64Data = note.coverUrl.split(',')[1];
-                await fs.writeFile(coverPath, Buffer.from(base64Data, 'base64'));
-              } else if (note.coverUrl.startsWith('http')) {
-                await downloadImageToFile(note.coverUrl, coverPath);
-              }
-              meta.cover = 'images/cover.jpg';
-              meta.images.push(meta.cover);
-            } catch (error) {
-              console.error('Failed to download cover:', error);
-            }
+          const result = await persistXhsNote(note);
+          if (!result.success || !result.noteId) {
+            throw new Error(result.error || '保存失败');
           }
-
-          // Save images if provided
-          if (note.images && Array.isArray(note.images)) {
-            const imagesDir = path.join(noteDir, 'images');
-            await fs.mkdir(imagesDir, { recursive: true });
-
-            for (let i = 0; i < note.images.length; i++) {
-              const imgData = note.images[i];
-              const imgPath = path.join(imagesDir, `${i}.jpg`);
-              if (imgData.startsWith('data:image')) {
-                const base64Data = imgData.split(',')[1];
-                await fs.writeFile(imgPath, Buffer.from(base64Data, 'base64'));
-                meta.images.push(`images/${i}.jpg`);
-              } else if (imgData.startsWith('http')) {
-                try {
-                  await downloadImageToFile(imgData, imgPath);
-                  meta.images.push(`images/${i}.jpg`);
-                } catch (error) {
-                  console.error('Failed to download image:', error);
-                  meta.images.push(imgData);
-                }
-              }
-            }
-          }
-
-          // Save video if provided
-          if (note.videoUrl && typeof note.videoUrl === 'string') {
-            try {
-              const videoName = 'video.mp4';
-              const videoPath = path.join(noteDir, videoName);
-              await downloadFile(note.videoUrl, videoPath);
-              meta.video = videoName;
-              meta.videoUrl = note.videoUrl;
-            } catch (error) {
-              console.error('Failed to download video:', error);
-            }
-          }
-
-          const metaPath = path.join(noteDir, 'meta.json');
-          await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-          await fs.writeFile(path.join(noteDir, 'content.md'), noteContent || '');
-
-          // Index the note
-          indexManager.addToQueue(normalizeNote(noteId, meta, noteContent || ''));
-
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, noteId }));
-
-          // Notify main window
-          win?.webContents.send('knowledge:new-note', { noteId, title: meta.title });
-
-          // Background transcription for video notes
-          if (meta.video) {
-            (async () => {
-              const videoPath = path.join(noteDir, meta.video as string);
-              const transcript = await transcribeVideoToText(videoPath);
-              if (transcript) {
-                meta.transcript = transcript;
-                meta.transcriptFile = 'transcript.txt';
-                await fs.writeFile(path.join(noteDir, meta.transcriptFile), transcript);
-                await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
-
-                // Index the transcript
-                indexManager.addToQueue(normalizeVideo(
-                  noteId,
-                  meta,
-                  transcript,
-                  'user'
-                ));
-
-                win?.webContents.send('knowledge:note-updated', { noteId, hasTranscript: true });
-              }
-            })().catch((err) => {
-              console.error('Failed to transcribe video:', err);
-            });
-          }
+          res.end(JSON.stringify({ success: true, noteId: result.noteId }));
         } catch (error) {
           console.error('Failed to save note:', error);
           res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -4412,6 +4599,10 @@ function startHttpServer() {
     } catch {}
   });
 }
+
+ipcMain.handle('xhs:save-note', async (_event, note: any) => {
+  return persistXhsNote(note);
+});
 
 app.whenReady().then(() => {
   ensureKnowledgeRedbookDir();

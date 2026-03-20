@@ -294,7 +294,7 @@ export function Layout({ children, currentView, onNavigate }: LayoutProps) {
           </div>
           <IndexingStatus />
           <div className="text-xs text-text-tertiary text-center">
-            v1.7.1 • 本地运行
+            v1.7.3 • 本地运行
           </div>
         </div>
       </aside>

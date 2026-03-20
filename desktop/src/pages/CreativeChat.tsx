@@ -66,6 +66,7 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
     const [isManageModalOpen, setIsManageModalOpen] = useState(false);
     const [isComposing, setIsComposing] = useState(false); // 中文输入法状态
     const messagesEndRef = useRef<HTMLDivElement>(null);
+    const selectedRoomIdRef = useRef<string | null>(null);
 
     const loadRooms = useCallback(async () => {
         setIsLoading(true);
@@ -105,6 +106,10 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             loadMessages(selectedRoom.id);
         }
     }, [selectedRoom, loadMessages]);
+
+    useEffect(() => {
+        selectedRoomIdRef.current = selectedRoom?.id || null;
+    }, [selectedRoom]);
 
     // 只在有流式消息时才平滑滚动
     const hasStreamingMessage = messages.some(m => m.isStreaming);
@@ -156,9 +161,19 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             }
         };
 
-        const handleStream = (_event: unknown, data: { advisorId: string; content: string; done: boolean }) => {
+        const handleStream = (_event: unknown, data: { roomId?: string; advisorId: string; advisorName?: string; advisorAvatar?: string; content: string; done: boolean }) => {
+            if (data.roomId && selectedRoom?.id && data.roomId !== selectedRoom.id) {
+                return;
+            }
+
             setMessages(prev => {
-                const lastMsgIdx = prev.findIndex(m => m.advisorId === data.advisorId && m.isStreaming);
+                let lastMsgIdx = -1;
+                for (let i = prev.length - 1; i >= 0; i -= 1) {
+                    if (prev[i].advisorId === data.advisorId && prev[i].isStreaming) {
+                        lastMsgIdx = i;
+                        break;
+                    }
+                }
                 if (lastMsgIdx !== -1) {
                     const updated = [...prev];
                     updated[lastMsgIdx] = {
@@ -168,7 +183,20 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
                     };
                     return updated;
                 }
-                return prev;
+
+                // 兜底：若流式分片先于 advisor-start 到达，先创建占位消息，避免回复丢失
+                const isDirector = data.advisorId === DIRECTOR_ID;
+                const fallbackMessage: ChatMessage = {
+                    id: `msg_${Date.now()}_${data.advisorId}_stream`,
+                    role: isDirector ? 'director' : 'advisor',
+                    advisorId: data.advisorId,
+                    advisorName: data.advisorName || (isDirector ? DIRECTOR_NAME : '成员'),
+                    advisorAvatar: data.advisorAvatar || (isDirector ? DIRECTOR_AVATAR : '🤖'),
+                    content: data.content || '',
+                    timestamp: new Date().toISOString(),
+                    isStreaming: !data.done,
+                };
+                return [...prev, fallbackMessage];
             });
 
             // Clear thinking state when done
@@ -180,7 +208,11 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             }
         };
 
-        const handleNewAdvisor = (_event: unknown, data: { advisorId: string; advisorName: string; advisorAvatar: string; phase?: string }) => {
+        const handleNewAdvisor = (_event: unknown, data: { roomId?: string; advisorId: string; advisorName: string; advisorAvatar: string; phase?: string }) => {
+            if (data.roomId && selectedRoom?.id && data.roomId !== selectedRoom.id) {
+                return;
+            }
+
             // Prevent duplicate: check if already have a streaming msg for this advisor
             setMessages(prev => {
                 const exists = prev.some(m => m.advisorId === data.advisorId && m.isStreaming);
@@ -210,7 +242,11 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             }));
         };
 
-        const handleThinking = (_event: unknown, data: { advisorId: string; type: string; content: string }) => {
+        const handleThinking = (_event: unknown, data: { roomId?: string; advisorId: string; type: string; content: string }) => {
+            if (data?.roomId && selectedRoom?.id && data.roomId !== selectedRoom.id) {
+                return;
+            }
+
             setThinkingState(prev => ({
                 ...prev,
                 [data.advisorId]: {
@@ -221,7 +257,11 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             }));
         };
 
-        const handleRag = (_event: unknown, data: { advisorId: string; type: string; content?: string; sources?: string[] }) => {
+        const handleRag = (_event: unknown, data: { roomId?: string; advisorId: string; type: string; content?: string; sources?: string[] }) => {
+            if (data?.roomId && selectedRoom?.id && data.roomId !== selectedRoom.id) {
+                return;
+            }
+
             setThinkingState(prev => ({
                 ...prev,
                 [data.advisorId]: {
@@ -232,7 +272,11 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             }));
         };
 
-        const handleTool = (_event: unknown, data: { advisorId: string; type: string; tool: { name: string; result?: { success: boolean; content: string } } }) => {
+        const handleTool = (_event: unknown, data: { roomId?: string; advisorId: string; type: string; tool: { name: string; result?: { success: boolean; content: string } } }) => {
+            if (data?.roomId && selectedRoom?.id && data.roomId !== selectedRoom.id) {
+                return;
+            }
+
             setThinkingState(prev => {
                 const current = prev[data.advisorId] || { isThinking: true, content: '', tools: [] };
                 const tools = [...(current.tools || [])];
@@ -257,8 +301,12 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
             });
         };
 
-        const handleDone = () => {
+        const handleDone = (_event: unknown, data?: { roomId?: string }) => {
             setIsSending(false);
+            if (data?.roomId && selectedRoom?.id && data.roomId !== selectedRoom.id) {
+                return;
+            }
+            setMessages(prev => prev.map(msg => msg.isStreaming ? { ...msg, isStreaming: false } : msg));
             // Reset all thinking states
             setThinkingState({});
         };
@@ -291,8 +339,9 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
     const handleSendMessage = async () => {
         if (!inputValue.trim() || !selectedRoom || isSending) return;
 
+        const clientMessageId = `msg_${Date.now()}`;
         const userMessage: ChatMessage = {
-            id: `msg_${Date.now()}`,
+            id: clientMessageId,
             role: 'user',
             content: inputValue.trim(),
             timestamp: new Date().toISOString()
@@ -303,14 +352,24 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
         setIsSending(true);
 
         try {
-            await window.ipcRenderer.invoke('chatrooms:send', {
-                roomId: selectedRoom.id,
+            const targetRoomId = selectedRoom.id;
+            const result = await window.ipcRenderer.invoke('chatrooms:send', {
+                roomId: targetRoomId,
                 message: userMessage.content,
+                clientMessageId,
                 context: activeFile ? {
                     filePath: activeFile.path,
                     fileContent: activeFile.content.substring(0, 10000) // 限制上下文长度，避免过长
                 } : undefined
-            });
+            }) as { success: boolean; error?: string };
+
+            if (!result?.success) {
+                throw new Error(result?.error || '群聊发送失败');
+            }
+
+            if (selectedRoomIdRef.current === targetRoomId) {
+                await loadMessages(targetRoomId);
+            }
         } catch (e) {
             console.error('Failed to send message:', e);
             setIsSending(false);
@@ -553,7 +612,16 @@ export function CreativeChat({ activeFile }: { activeFile?: { path: string; cont
                                 >
                                     <Trash2 className="w-5 h-5" />
                                 </button>
-                                {/* 系统聊天室不显示管理按钮 */}
+                                {/* 六顶思考帽系统群支持直接删除 */}
+                                {isSystemRoom(selectedRoom) && (
+                                    <button
+                                        onClick={handleDeleteRoom}
+                                        className="p-2 text-text-tertiary hover:text-red-500 hover:bg-surface-secondary rounded-lg transition-colors"
+                                        title="删除群聊"
+                                    >
+                                        <X className="w-5 h-5" />
+                                    </button>
+                                )}
                                 {!isSystemRoom(selectedRoom) && (
                                     <button
                                         onClick={() => setIsManageModalOpen(true)}

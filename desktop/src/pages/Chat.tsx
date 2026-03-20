@@ -38,6 +38,9 @@ interface ChatProps {
   fixedSessionBannerText?: string;
   shortcuts?: Array<{ label: string; text: string }>;
   welcomeShortcuts?: Array<{ label: string; text: string }>;
+  showWelcomeShortcuts?: boolean;
+  showComposerShortcuts?: boolean;
+  fixedSessionContextIndicatorMode?: 'top' | 'corner-ring' | 'none';
   welcomeTitle?: string;
   welcomeSubtitle?: string;
   contentLayout?: 'default' | 'center-2-3';
@@ -63,6 +66,20 @@ interface ChatRuntimeState {
 }
 
 const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 80;
+const STREAM_CHUNK_DEDUPE_WINDOW_MS = 120;
+
+function consumeBufferedChunk(buffer: string, chunk: string): string {
+  if (!buffer || !chunk) return buffer;
+  if (buffer.startsWith(chunk)) {
+    return buffer.slice(chunk.length);
+  }
+
+  const index = buffer.indexOf(chunk);
+  if (index === -1) {
+    return buffer;
+  }
+  return `${buffer.slice(0, index)}${buffer.slice(index + chunk.length)}`;
+}
 
 export function Chat({
   pendingMessage,
@@ -73,6 +90,9 @@ export function Chat({
   fixedSessionBannerText = '当前对话已关联到文档',
   shortcuts: shortcutsProp,
   welcomeShortcuts: welcomeShortcutsProp,
+  showWelcomeShortcuts = true,
+  showComposerShortcuts = true,
+  fixedSessionContextIndicatorMode = 'top',
   welcomeTitle = '有什么可以帮您？',
   welcomeSubtitle = '我可以帮您阅读和编辑稿件、分析内容、提供创作建议',
   contentLayout = 'default',
@@ -95,6 +115,7 @@ export function Chat({
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenu>({ visible: false, x: 0, y: 0, text: '' });
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
   const [showRoomPicker, setShowRoomPicker] = useState(false);
+  const [isRoomPickerLoading, setIsRoomPickerLoading] = useState(false);
   const [contextUsage, setContextUsage] = useState<ChatContextUsage | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -103,6 +124,7 @@ export function Chat({
   // Throttle buffer for streaming updates
   const pendingUpdateRef = useRef<{ content: string } | null>(null);
   const updateTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const lastStreamChunkRef = useRef<{ content: string; at: number }>({ content: '', at: 0 });
   
   // 缓冲未处理的 chunk，用于解决页面加载期间的数据丢失问题
   const missedChunksRef = useRef<string>('');
@@ -130,6 +152,24 @@ export function Chat({
       }
     } catch (error) {
       console.error('Failed to load context usage:', error);
+    }
+  }, []);
+
+  const loadChatRooms = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) {
+      setIsRoomPickerLoading(true);
+    }
+    try {
+      const rooms = await window.ipcRenderer.invoke('chatrooms:list') as ChatRoom[];
+      setChatRooms(Array.isArray(rooms) ? rooms : []);
+    } catch (error) {
+      console.error('Failed to load chat rooms:', error);
+      setChatRooms([]);
+    } finally {
+      if (!silent) {
+        setIsRoomPickerLoading(false);
+      }
     }
   }, []);
 
@@ -169,7 +209,7 @@ export function Chat({
 
   // Load sessions on mount
   useEffect(() => {
-    loadChatRooms();
+    void loadChatRooms({ silent: true });
 
     // Handle fixed session (File-Bound Mode)
     if (fixedSessionId) {
@@ -187,17 +227,21 @@ export function Chat({
         setSessions(list);
       }).catch(console.error);
     }
-  }, [fixedSessionId]); // Add fixedSessionId dependency
+  }, [fixedSessionId, loadChatRooms]); // Add fixedSessionId dependency
 
-  // 加载群聊列表
-  const loadChatRooms = async () => {
-    try {
-      const rooms = await window.ipcRenderer.invoke('chatrooms:list') as ChatRoom[];
-      setChatRooms(rooms || []);
-    } catch (error) {
-      console.error('Failed to load chat rooms:', error);
-    }
-  };
+  useEffect(() => {
+    const handleRunnerMessage = (_: unknown, payload?: { sessionId?: string }) => {
+      const sid = payload?.sessionId;
+      if (!sid || !currentSessionId) return;
+      if (sid !== currentSessionId) return;
+      void selectSession(sid);
+    };
+
+    window.ipcRenderer.on('redclaw:runner-message', handleRunnerMessage);
+    return () => {
+      window.ipcRenderer.off('redclaw:runner-message', handleRunnerMessage);
+    };
+  }, [currentSessionId]);
 
   // 处理从其他页面传来的待发送消息（如知识库的"AI脑爆"）
   useEffect(() => {
@@ -443,7 +487,12 @@ export function Chat({
   }, []);
 
   // 处理文字选中
-  const handleTextSelection = useCallback(() => {
+  const handleTextSelection = useCallback((event?: MouseEvent) => {
+    const target = event?.target as HTMLElement | null;
+    if (target?.closest('[data-selection-menu]')) {
+      return;
+    }
+
     // 延迟执行，确保选中完成
     setTimeout(() => {
       const selection = window.getSelection();
@@ -477,6 +526,11 @@ export function Chat({
     setShowRoomPicker(false);
   }, []);
 
+  const handleOpenRoomPicker = useCallback(async () => {
+    setShowRoomPicker(true);
+    await loadChatRooms();
+  }, [loadChatRooms]);
+
   // 发送到群聊
   const handleSendToRoom = useCallback(async (roomId: string) => {
     if (!selectionMenu.text) return;
@@ -499,9 +553,27 @@ export function Chat({
     }
   }, [selectionMenu.text]);
 
+  useEffect(() => {
+    if (!selectionMenu.visible) {
+      return;
+    }
+    void loadChatRooms({ silent: true });
+  }, [selectionMenu.visible, loadChatRooms]);
+
+  useEffect(() => {
+    const handleSpaceChanged = () => {
+      setShowRoomPicker(false);
+      void loadChatRooms({ silent: true });
+    };
+    window.ipcRenderer.on('space:changed', handleSpaceChanged);
+    return () => {
+      window.ipcRenderer.off('space:changed', handleSpaceChanged);
+    };
+  }, [loadChatRooms]);
+
   // 监听选中事件
   useEffect(() => {
-    const handleMouseUp = () => handleTextSelection();
+    const handleMouseUp = (event: MouseEvent) => handleTextSelection(event);
 
     // 在整个文档上监听
     document.addEventListener('mouseup', handleMouseUp);
@@ -642,6 +714,18 @@ export function Chat({
     };
 
     const handleResponseChunk = (_: unknown, { content }: { content: string }) => {
+      if (!content) return;
+
+      const now = Date.now();
+      const lastChunk = lastStreamChunkRef.current;
+      if (
+        content === lastChunk.content &&
+        (now - lastChunk.at) <= STREAM_CHUNK_DEDUPE_WINDOW_MS
+      ) {
+        return;
+      }
+      lastStreamChunkRef.current = { content, at: now };
+
       // 直接更新 Ref 缓冲，防止闭包过时
       missedChunksRef.current += content;
 
@@ -660,25 +744,20 @@ export function Chat({
 
           if (!chunk) return;
 
-          // 清空对应的缓冲，因为即将写入 State
-          missedChunksRef.current = missedChunksRef.current.replace(chunk, '');
-
           // 3. Batch update
           setMessages(prev => {
             // 如果消息列表为空，说明可能正在加载中，保持在 missedChunksRef 中等待回放
             if (prev.length === 0) {
-                // 回滚缓冲
-                missedChunksRef.current = chunk + missedChunksRef.current;
                 return prev;
             }
 
             const lastMsg = prev[prev.length - 1];
             // 如果最后一条不是 AI 消息，也缓冲起来
             if (!lastMsg || lastMsg.role !== 'ai') {
-                missedChunksRef.current = chunk + missedChunksRef.current;
                 return prev;
             }
 
+            missedChunksRef.current = consumeBufferedChunk(missedChunksRef.current, chunk);
             return [...prev.slice(0, -1), { ...lastMsg, content: lastMsg.content + chunk }];
           });
         }, 100); // 10FPS throttle
@@ -875,10 +954,10 @@ export function Chat({
         pendingUpdateRef.current = null;
 
         if (chunk) {
-            missedChunksRef.current = missedChunksRef.current.replace(chunk, '');
             setMessages(prev => {
                 const lastMsg = prev[prev.length - 1];
                 if (!lastMsg || lastMsg.role !== 'ai') return prev;
+                missedChunksRef.current = consumeBufferedChunk(missedChunksRef.current, chunk);
                 return [...prev.slice(0, -1), { ...lastMsg, content: lastMsg.content + chunk }];
             });
         }
@@ -1019,12 +1098,33 @@ export function Chat({
     { label: '💡 创作建议', text: '请基于当前内容提供一些创作方向的建议。' }
   ];
 
-  const contextPercent = Math.max(0, Math.min(100, Math.round((contextUsage?.compactRatio || 0) * 100)));
-  const contextBadgeClass = contextPercent >= 90
+  const formatTokenLabel = (value?: number) => {
+    const safe = Math.max(0, Math.round(Number(value || 0)));
+    if (safe >= 1000) {
+      return `${Math.round(safe / 1000)}k`;
+    }
+    return `${safe}`;
+  };
+
+  const contextUsedPercent = Math.max(0, Math.min(100, Math.round((contextUsage?.compactRatio || 0) * 100)));
+  const contextRemainingPercent = Math.max(0, 100 - contextUsedPercent);
+  const contextBadgeClass = contextUsedPercent >= 90
     ? 'text-red-600 border-red-500/40 bg-red-500/10'
-    : contextPercent >= 70
+    : contextUsedPercent >= 70
       ? 'text-amber-600 border-amber-500/40 bg-amber-500/10'
       : 'text-text-secondary border-border bg-surface-secondary/90';
+  const compactThreshold = Math.max(0, Math.round(contextUsage?.compactThreshold || 0));
+  const estimatedTotalTokens = Math.max(0, Math.round(contextUsage?.estimatedTotalTokens || 0));
+  const contextRemainingRatio = Math.max(0, Math.min(1, 1 - (contextUsage?.compactRatio || 0)));
+  const contextRingRadius = 17;
+  const contextRingCircumference = 2 * Math.PI * contextRingRadius;
+  const contextRingOffset = contextRingCircumference * (1 - contextRemainingRatio);
+  const contextRingColorClass = contextRemainingPercent <= 15
+    ? 'text-red-500'
+    : contextRemainingPercent <= 35
+      ? 'text-amber-500'
+      : 'text-emerald-500';
+  const isCompactWorkflowMode = Boolean(fixedSessionId && fixedSessionContextIndicatorMode === 'corner-ring');
 
   return (
     <div className="flex h-full">
@@ -1110,17 +1210,65 @@ export function Chat({
         )}
 
         {/* Linked Session Indicator */}
-        {fixedSessionId && currentSessionId && fixedSessionBannerText && (
+        {fixedSessionId && currentSessionId && fixedSessionBannerText && fixedSessionContextIndicatorMode === 'top' && (
             <div className="absolute top-0 left-0 right-0 z-10 flex flex-col items-center gap-1 pointer-events-none">
                 <div className="bg-surface-secondary/90 backdrop-blur text-xs font-medium text-text-secondary px-3 py-1 rounded-b-lg shadow-sm border-b border-x border-border">
                    {fixedSessionBannerText}
                 </div>
                 {contextUsage?.success && (
                   <div className={clsx('text-[11px] px-2.5 py-1 rounded-full border backdrop-blur', contextBadgeClass)}>
-                    上下文 {contextPercent}% · {contextUsage.estimatedTotalTokens || 0}/{contextUsage.compactThreshold || 0} tokens · compact {contextUsage.compactRounds || 0} 次
+                    上下文 {contextUsedPercent}% · {contextUsage.estimatedTotalTokens || 0}/{contextUsage.compactThreshold || 0} tokens · compact {contextUsage.compactRounds || 0} 次
                   </div>
                 )}
             </div>
+        )}
+
+        {/* Corner Ring Compact Indicator (for fixed session, e.g. RedClaw) */}
+        {fixedSessionId && currentSessionId && contextUsage?.success && fixedSessionContextIndicatorMode === 'corner-ring' && (
+          <div className="absolute right-6 bottom-28 z-20 pointer-events-none">
+            <div className="relative group pointer-events-auto">
+              <button
+                type="button"
+                className="relative w-14 h-14 rounded-full border border-border bg-surface-primary/95 backdrop-blur shadow-md flex items-center justify-center"
+                title="上下文窗口剩余空间"
+                aria-label="上下文窗口剩余空间"
+              >
+                <svg className="w-11 h-11 -rotate-90" viewBox="0 0 44 44" aria-hidden="true">
+                  <circle
+                    cx="22"
+                    cy="22"
+                    r={contextRingRadius}
+                    fill="transparent"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    className="text-border"
+                  />
+                  <circle
+                    cx="22"
+                    cy="22"
+                    r={contextRingRadius}
+                    fill="transparent"
+                    stroke="currentColor"
+                    strokeWidth="3"
+                    strokeLinecap="round"
+                    className={contextRingColorClass}
+                    strokeDasharray={contextRingCircumference}
+                    strokeDashoffset={contextRingOffset}
+                  />
+                </svg>
+                <span className="absolute inset-0 flex items-center justify-center text-[11px] font-semibold text-text-primary">
+                  {contextRemainingPercent}%
+                </span>
+              </button>
+
+              <div className="absolute right-0 bottom-[68px] w-64 p-3 rounded-2xl border border-border bg-surface-primary/95 backdrop-blur shadow-xl text-xs text-text-secondary opacity-0 pointer-events-none transition-opacity duration-150 group-hover:opacity-100">
+                <div className="font-semibold text-text-primary mb-1">背景信息窗口</div>
+                <div>{contextUsedPercent}% 已用（剩余 {contextRemainingPercent}%）</div>
+                <div>已用 {formatTokenLabel(estimatedTotalTokens)} 标记，共 {formatTokenLabel(compactThreshold)}</div>
+                <div className="mt-1 text-text-tertiary">Codex 自动压缩其背景信息</div>
+              </div>
+            </div>
+          </div>
         )}
 
         {/* Header Actions - 清除按钮 */}
@@ -1158,18 +1306,19 @@ export function Chat({
                 </p>
               </div>
 
-              {/* 快捷功能提示 */}
-              <div className="flex flex-wrap justify-center gap-2 text-xs">
-                {welcomeShortcuts.map((shortcut) => (
-                  <button
-                    key={shortcut.label}
-                    onClick={() => sendMessage(shortcut.text)}
-                    className="px-3 py-1.5 bg-surface-secondary hover:bg-surface-tertiary border border-transparent hover:border-border rounded-full text-text-secondary hover:text-accent-primary transition-all cursor-pointer"
-                  >
-                    {shortcut.label}
-                  </button>
-                ))}
-              </div>
+              {showWelcomeShortcuts && welcomeShortcuts.length > 0 && (
+                <div className="flex flex-wrap justify-center gap-2 text-xs">
+                  {welcomeShortcuts.map((shortcut) => (
+                    <button
+                      key={shortcut.label}
+                      onClick={() => sendMessage(shortcut.text)}
+                      className="px-3 py-1.5 bg-surface-secondary hover:bg-surface-tertiary border border-transparent hover:border-border rounded-full text-text-secondary hover:text-accent-primary transition-all cursor-pointer"
+                    >
+                      {shortcut.label}
+                    </button>
+                  ))}
+                </div>
+              )}
 
               {/* 居中的输入框 */}
               <form onSubmit={handleSubmit} className="relative w-full mt-8">
@@ -1199,13 +1348,13 @@ export function Chat({
             {selectionMenu.visible && (
               <div
                 data-selection-menu
-                className="fixed z-[100] transform -translate-x-1/2 -translate-y-full"
+                className="fixed z-[1000] transform -translate-x-1/2 -translate-y-full"
                 style={{ left: selectionMenu.x, top: selectionMenu.y }}
               >
                 <div className="bg-surface-primary border border-border rounded-lg shadow-xl overflow-hidden">
                   {!showRoomPicker ? (
                     <button
-                      onClick={() => setShowRoomPicker(true)}
+                      onClick={() => void handleOpenRoomPicker()}
                       className="flex items-center gap-2 px-3 py-2 text-sm text-text-primary hover:bg-surface-secondary transition-colors whitespace-nowrap"
                     >
                       <Users className="w-4 h-4" />
@@ -1217,7 +1366,12 @@ export function Chat({
                         选择群聊
                       </div>
                       <div className="max-h-48 overflow-y-auto">
-                        {chatRooms.length === 0 ? (
+                        {isRoomPickerLoading ? (
+                          <div className="px-3 py-2 text-sm text-text-tertiary flex items-center gap-2">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            加载群聊中...
+                          </div>
+                        ) : chatRooms.length === 0 ? (
                           <div className="px-3 py-2 text-sm text-text-tertiary">
                             暂无群聊
                           </div>
@@ -1255,6 +1409,8 @@ export function Chat({
                         msg={msg}
                         copiedMessageId={copiedMessageId}
                         onCopyMessage={handleCopyMessage}
+                        workflowPlacement={isCompactWorkflowMode ? 'bottom' : 'top'}
+                        workflowVariant={isCompactWorkflowMode ? 'compact' : 'default'}
                       />
                   </ErrorBoundary>
                 ))}
@@ -1265,19 +1421,20 @@ export function Chat({
             {/* Input Area - 底部固定 */}
             <div className="p-6 pt-2 border-t border-border bg-surface-primary">
               <div className={contentWidthClass}>
-                {/* Shortcuts */}
-                <div className="flex gap-2 mb-3 overflow-x-auto no-scrollbar py-1">
-                  {shortcuts.map((shortcut) => (
-                    <button
-                      key={shortcut.label}
-                      onClick={() => sendMessage(shortcut.text)}
-                      disabled={isProcessing}
-                      className="flex-shrink-0 px-3 py-1.5 bg-surface-secondary hover:bg-surface-tertiary border border-border rounded-full text-xs text-text-secondary transition-colors disabled:opacity-50 hover:text-accent-primary"
-                    >
-                      {shortcut.label}
-                    </button>
-                  ))}
-                </div>
+                {showComposerShortcuts && shortcuts.length > 0 && (
+                  <div className="flex gap-2 mb-3 overflow-x-auto no-scrollbar py-1">
+                    {shortcuts.map((shortcut) => (
+                      <button
+                        key={shortcut.label}
+                        onClick={() => sendMessage(shortcut.text)}
+                        disabled={isProcessing}
+                        className="flex-shrink-0 px-3 py-1.5 bg-surface-secondary hover:bg-surface-tertiary border border-border rounded-full text-xs text-text-secondary transition-colors disabled:opacity-50 hover:text-accent-primary"
+                      >
+                        {shortcut.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
 
                 <form onSubmit={handleSubmit} className="relative w-full">
                   <input

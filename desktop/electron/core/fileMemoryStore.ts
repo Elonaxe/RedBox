@@ -22,6 +22,7 @@ interface MemoryFileData {
 
 const MEMORY_DIR = 'memory';
 const MEMORY_FILE = 'user-memories.json';
+const CURATED_MEMORY_FILE = 'MEMORY.md';
 const MAX_MEMORY_ITEMS = 500;
 
 const now = (): number => Date.now();
@@ -47,6 +48,11 @@ const memoryFilePath = (): string => {
   return path.join(base, MEMORY_DIR, MEMORY_FILE);
 };
 
+const curatedMemoryFilePath = (): string => {
+  const base = getWorkspacePaths().base;
+  return path.join(base, MEMORY_DIR, CURATED_MEMORY_FILE);
+};
+
 const defaultData = (): MemoryFileData => ({
   version: 1,
   updatedAt: now(),
@@ -55,6 +61,12 @@ const defaultData = (): MemoryFileData => ({
 
 const ensureDir = async (): Promise<void> => {
   await fs.mkdir(path.dirname(memoryFilePath()), { recursive: true });
+};
+
+const formatDateTime = (timestamp: number): string => {
+  const date = new Date(Number(timestamp || Date.now()));
+  if (Number.isNaN(date.getTime())) return new Date().toISOString();
+  return date.toISOString();
 };
 
 const normalizeContentForDedup = (content: string): string => {
@@ -150,6 +162,51 @@ const dedupeAndPruneMemories = (memories: FileUserMemory[]): FileUserMemory[] =>
   return sortMemories(Array.from(new Set(byExact.values()))).slice(0, MAX_MEMORY_ITEMS);
 };
 
+const buildCuratedMemoryMarkdown = (memories: FileUserMemory[]): string => {
+  const selected = sortMemories(memories).slice(0, 120);
+  const preference = selected.filter((item) => item.type === 'preference');
+  const fact = selected.filter((item) => item.type === 'fact');
+  const general = selected.filter((item) => item.type === 'general');
+
+  const renderSection = (title: string, items: FileUserMemory[]): string[] => {
+    if (items.length === 0) {
+      return [`## ${title}`, '(暂无)'];
+    }
+
+    return [
+      `## ${title}`,
+      ...items.map((item) => {
+        const tags = item.tags.length > 0 ? ` [${item.tags.join(', ')}]` : '';
+        return `- ${item.content}${tags} (updated: ${formatDateTime(item.updated_at)})`;
+      }),
+    ];
+  };
+
+  return [
+    '# MEMORY.md',
+    '',
+    '这个文件是用户长期记忆摘要（可人工编辑）。',
+    '自动生成时间：' + new Date().toISOString(),
+    '',
+    ...renderSection('偏好 Preferences', preference),
+    '',
+    ...renderSection('事实 Facts', fact),
+    '',
+    ...renderSection('其他 General', general),
+    '',
+    '> 说明：本文件由系统自动维护，同时支持人工调整。若与最新用户明确指令冲突，以最新指令为准。',
+  ].join('\n');
+};
+
+const syncCuratedMemoryMarkdown = async (memories: FileUserMemory[]): Promise<void> => {
+  await ensureDir();
+  const filePath = curatedMemoryFilePath();
+  const tempPath = `${filePath}.tmp`;
+  const markdown = buildCuratedMemoryMarkdown(memories);
+  await fs.writeFile(tempPath, markdown, 'utf-8');
+  await fs.rename(tempPath, filePath);
+};
+
 const readData = async (): Promise<MemoryFileData> => {
   const filePath = memoryFilePath();
   try {
@@ -187,6 +244,7 @@ const writeData = async (data: MemoryFileData): Promise<void> => {
   const tempPath = `${filePath}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(payload, null, 2), 'utf-8');
   await fs.rename(tempPath, filePath);
+  await syncCuratedMemoryMarkdown(payload.memories);
 };
 
 const migrateFromDbIfNeeded = async (): Promise<void> => {
@@ -227,6 +285,7 @@ const generateMemoryId = (): string => {
 export async function listUserMemoriesFromFile(): Promise<FileUserMemory[]> {
   await migrateFromDbIfNeeded();
   const data = await readData();
+  await syncCuratedMemoryMarkdown(data.memories);
   return sortMemories(data.memories);
 }
 
@@ -337,11 +396,32 @@ export async function markMemoryAccessed(id: string): Promise<void> {
 
 export async function getLongTermMemoryPrompt(maxItems = 30): Promise<string> {
   const memories = await listUserMemoriesFromFile();
-  if (!memories.length) return '';
+  const curatedMemoryMarkdown = await (async () => {
+    try {
+      return await fs.readFile(curatedMemoryFilePath(), 'utf-8');
+    } catch {
+      return '';
+    }
+  })();
+  if (!memories.length && !curatedMemoryMarkdown.trim()) return '';
 
   const selected = memories.slice(0, Math.max(1, maxItems));
-  return selected.map((m, index) => {
+  const listPrompt = selected.map((m, index) => {
     const tagText = m.tags.length ? ` [tags: ${m.tags.join(', ')}]` : '';
     return `${index + 1}. [${m.type}] ${m.content}${tagText}`;
   }).join('\n');
+
+  if (!curatedMemoryMarkdown.trim()) {
+    return listPrompt;
+  }
+
+  return [
+    '<memory_markdown>',
+    curatedMemoryMarkdown.slice(0, 16000),
+    '</memory_markdown>',
+    '',
+    '<memory_index>',
+    listPrompt,
+    '</memory_index>',
+  ].join('\n');
 }

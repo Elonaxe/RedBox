@@ -35,6 +35,12 @@ import { createCompressionService } from '../core/compressionService';
 import { getLongTermMemoryPrompt } from '../core/fileMemoryStore';
 import { getRedClawProjectContextPrompt } from '../core/redclawStore';
 import { getMcpServers } from '../core/mcpStore';
+import {
+  ensureRedClawOnboardingCompletedWithDefaults,
+  handleRedClawOnboardingTurn,
+  loadRedClawProfilePromptBundle,
+  type RedClawProfilePromptBundle,
+} from '../core/redclawProfileStore';
 
 interface SessionMetadata {
   associatedFilePath?: string;
@@ -164,6 +170,27 @@ export class PiChatService {
     }
   }
 
+  private normalizeStreamingTextDelta(rawDelta: string, currentResponse: string): string {
+    const delta = typeof rawDelta === 'string' ? rawDelta : '';
+    if (!delta) return '';
+    if (!currentResponse) return delta;
+
+    // Some providers emit cumulative content instead of strict token deltas.
+    if (delta.startsWith(currentResponse)) {
+      return delta.slice(currentResponse.length);
+    }
+
+    // Merge overlapped chunks to avoid duplicated tail/head when stream framing differs.
+    const maxOverlap = Math.min(currentResponse.length, delta.length);
+    for (let overlap = maxOverlap; overlap >= 4; overlap -= 1) {
+      if (currentResponse.endsWith(delta.slice(0, overlap))) {
+        return delta.slice(overlap);
+      }
+    }
+
+    return delta;
+  }
+
   abort() {
     if (this.abortController) {
       this.abortController.abort();
@@ -255,17 +282,15 @@ export class PiChatService {
     this.sessionId = sessionId;
     this.abortController = new AbortController();
     const signal = this.abortController.signal;
+    this.setRuntimeState({
+      isProcessing: true,
+      partialResponse: '',
+    });
 
     const settings = (getSettings() || {}) as Record<string, unknown>;
     const apiKey = (settings.api_key as string) || (settings.openaiApiKey as string) || process.env.OPENAI_API_KEY || '';
     const baseURL = (settings.api_endpoint as string) || (settings.openaiApiBase as string) || 'https://api.openai.com/v1';
     const modelName = (settings.model_name as string) || (settings.openaiModel as string) || 'gpt-4o';
-
-    if (!apiKey) {
-      this.sendToUI('chat:error', { message: 'API Key 未配置' });
-      this.sendToUI('chat:done', {});
-      return;
-    }
 
     const workspacePaths = getWorkspacePaths();
     const workspace = workspacePaths.base;
@@ -277,9 +302,50 @@ export class PiChatService {
       console.warn('[PiChatService] Failed to load skills:', error);
     }
 
+    let metadata = this.getSessionMetadata(sessionId);
+    let redClawProfileBundle: RedClawProfilePromptBundle | null = null;
+
+    if (this.shouldHandleRedClawOnboarding(metadata)) {
+      try {
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+        const isFirstRedClawTurn = this.isFirstAssistantTurn(sessionId);
+        if (isFirstRedClawTurn) {
+          const onboarding = await handleRedClawOnboardingTurn(content);
+          if (onboarding.handled) {
+            const onboardingResponse = (onboarding.responseText || '').trim();
+            if (onboardingResponse) {
+              this.emitLocalAssistantResponse(sessionId, onboardingResponse);
+            }
+            this.abortController = null;
+            this.setRuntimeState({ isProcessing: false });
+            this.sendToUI('chat:done', {});
+            return;
+          }
+        } else if (!redClawProfileBundle.onboardingState.completedAt) {
+          await ensureRedClawOnboardingCompletedWithDefaults();
+        }
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+      } catch (error) {
+        console.warn('[PiChatService] RedClaw onboarding/profile failed:', error);
+      }
+    } else if (metadata.contextType === 'redclaw') {
+      try {
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+      } catch (error) {
+        console.warn('[PiChatService] Failed to load RedClaw profile bundle for non-primary session:', error);
+      }
+    }
+
+    if (!apiKey) {
+      this.abortController = null;
+      this.setRuntimeState({ isProcessing: false });
+      this.sendToUI('chat:error', { message: 'API Key 未配置' });
+      this.sendToUI('chat:done', {});
+      return;
+    }
+
     const model = this.createModelWithBaseUrl(modelName, baseURL);
     const redClawCompactTargetTokens = this.getRedClawCompactTargetTokens(settings);
-    let metadata = this.getSessionMetadata(sessionId);
     metadata = await this.maybeCompactContext({
       sessionId,
       currentInput: content,
@@ -292,7 +358,20 @@ export class PiChatService {
     });
     const longTermMemory = await this.loadLongTermMemoryContext();
     const redClawProjectContext = await this.loadRedClawProjectContext(metadata);
-    const systemPrompt = this.buildSystemPrompt(workspacePaths, metadata, longTermMemory, redClawProjectContext);
+    if (metadata.contextType === 'redclaw' && !redClawProfileBundle) {
+      try {
+        redClawProfileBundle = await loadRedClawProfilePromptBundle();
+      } catch (error) {
+        console.warn('[PiChatService] Failed to reload RedClaw profile bundle:', error);
+      }
+    }
+    const systemPrompt = this.buildSystemPrompt(
+      workspacePaths,
+      metadata,
+      longTermMemory,
+      redClawProjectContext,
+      redClawProfileBundle,
+    );
     const history = this.historyToAgentMessages(sessionId, content, metadata);
     console.log('[PiChatService] sendMessage', {
       sessionId,
@@ -305,11 +384,6 @@ export class PiChatService {
       workspaceBase: workspacePaths.base,
       manuscriptsPath: workspacePaths.manuscripts,
       redClawCompactTargetTokens,
-    });
-
-    this.setRuntimeState({
-      isProcessing: true,
-      partialResponse: '',
     });
 
     try {
@@ -357,6 +431,34 @@ export class PiChatService {
     }
   }
 
+  private emitLocalAssistantResponse(sessionId: string, content: string) {
+    const text = String(content || '').trim();
+    if (!text) return;
+
+    this.sendToUI('chat:response-chunk', { content: text });
+    this.sendToUI('chat:response-end', { content: text });
+    this.setRuntimeState({ partialResponse: text });
+
+    addChatMessage({
+      id: `msg_${Date.now()}`,
+      session_id: sessionId,
+      role: 'assistant',
+      content: text,
+    });
+  }
+
+  private isFirstAssistantTurn(sessionId: string): boolean {
+    const history = getChatMessages(sessionId).filter((msg) => msg.role === 'user' || msg.role === 'assistant');
+    const assistantCount = history.filter((msg) => msg.role === 'assistant').length;
+    return assistantCount === 0 && history.length <= 1;
+  }
+
+  private shouldHandleRedClawOnboarding(metadata: SessionMetadata): boolean {
+    if (metadata.contextType !== 'redclaw') return false;
+    const contextId = String(metadata.contextId || '');
+    return contextId.startsWith('redclaw-singleton:');
+  }
+
   private cleanupAgentSubscription() {
     if (this.unsubscribeAgentEvents) {
       this.unsubscribeAgentEvents();
@@ -399,11 +501,12 @@ export class PiChatService {
             break;
           }
           if (event.assistantMessageEvent.type === 'text_delta') {
-            const delta = event.assistantMessageEvent.delta;
-            if (delta) {
-              runtime.response += delta;
+            const rawDelta = event.assistantMessageEvent.delta || '';
+            const normalizedDelta = this.normalizeStreamingTextDelta(rawDelta, runtime.response);
+            if (normalizedDelta) {
+              runtime.response += normalizedDelta;
               this.setRuntimeState({ partialResponse: runtime.response });
-              this.sendToUI('chat:response-chunk', { content: delta });
+              this.sendToUI('chat:response-chunk', { content: normalizedDelta });
             }
           }
           break;
@@ -1193,7 +1296,8 @@ export class PiChatService {
     workspacePaths: ReturnType<typeof getWorkspacePaths>,
     metadata: SessionMetadata,
     longTermMemory: string,
-    redClawProjectContext: string
+    redClawProjectContext: string,
+    redClawProfileBundle?: RedClawProfilePromptBundle | null,
   ): string {
     const workspace = workspacePaths.base;
     const skillsXml = this.skillManager.getSkillsXml();
@@ -1217,6 +1321,8 @@ export class PiChatService {
       `- manuscripts: ${workspacePaths.manuscripts}`,
       `- media: ${workspacePaths.media}`,
       `- redclaw: ${workspacePaths.redclaw}`,
+      `- redclaw/profile: ${workspacePaths.redclaw}/profile`,
+      `- memory: ${workspacePaths.base}/memory`,
       '',
       '固定目录树（按此定位，不要盲目搜索）：',
       '```',
@@ -1228,6 +1334,8 @@ export class PiChatService {
       '├── manuscripts/',
       '├── media/',
       '├── redclaw/',
+      '│   └── profile/',
+      '├── memory/',
       '└── skills/',
       '```',
       '',
@@ -1244,6 +1352,7 @@ export class PiChatService {
       '- 禁止基于历史消息或猜测编造文件列表、数量和目录状态。',
       '- 处理本应用能力（空间、稿件、知识库、智囊团、RedClaw、媒体库、生图、档案、漫步、设置、技能、记忆）时，优先使用 `app_cli` 工具，以 CLI 命令方式操作。',
       '- 只有在 `app_cli` 不覆盖的场景下，才回退到其他文件工具或 bash。',
+      '- 当用户要求“创建/修改 RedClaw 自动化设置（心跳、定时任务、长周期任务、后台轮询参数）”时，必须先用 `app_cli` 查询当前状态，再执行对应 set/add/update 命令。',
       '- CLI-first 规则：未来新增功能页必须补充 `app_cli` 子命令，保证可被 AI 自动化调用。',
       '- 你拥有 save_memory 工具：当用户明确给出长期偏好、事实、目标约束时，应保存为长期记忆。',
       '',
@@ -1251,6 +1360,14 @@ export class PiChatService {
       '- 空间列表: `app_cli(command="spaces list")`',
       '- 稿件列表: `app_cli(command="manuscripts list")`',
       '- RedClaw建项目: `app_cli(command="redclaw create --goal \\"做一个小红书选题\\"")`',
+      '- RedClaw心跳状态: `app_cli(command="redclaw heartbeat-status")`',
+      '- RedClaw心跳配置: `app_cli(command="redclaw heartbeat-set --enabled true --interval 30 --report-main true")`',
+      '- RedClaw定时任务列表: `app_cli(command="redclaw schedule-list")`',
+      '- RedClaw新增定时任务: `app_cli(command="redclaw schedule-add --name \\"每日创作\\" --mode daily --time 09:30 --prompt \\"推进创作流程并保存文案包\\"")`',
+      '- RedClaw修改定时任务: `app_cli(command="redclaw schedule-update --task-id <task-id> --time 10:00 --enabled true")`',
+      '- RedClaw新增长周期任务: `app_cli(command="redclaw long-add --name \\"30天实验\\" --objective \\"...\\" --step-prompt \\"...\\" --rounds 30")`',
+      '- RedClaw修改长周期任务: `app_cli(command="redclaw long-update --task-id <task-id> --interval 720 --rounds 21")`',
+      '- RedClaw修改后台轮询: `app_cli(command="redclaw runner-set-config --interval 20 --max-automation 2 --heartbeat-enabled true --heartbeat-interval 30")`',
       '- 生图入媒体库: `app_cli(command="image generate --prompt \\"...\\\" --count 2")`',
       '- MCP列表: `app_cli(command="mcp list --enabled-only true")`',
       '- MCP工具清单: `app_cli(command="mcp tools --id <server-id>")`',
@@ -1281,6 +1398,40 @@ export class PiChatService {
         '</long_term_memory>',
         '回答应优先与长期记忆保持一致；若用户新指令与旧记忆冲突，以最新明确指令为准并调用 save_memory 更新。',
       );
+    }
+
+    if (metadata.contextType === 'redclaw' && redClawProfileBundle) {
+      promptParts.push(
+        '',
+        '## RedClaw 个性化档案（空间隔离）',
+        `- ProfileRoot: ${redClawProfileBundle.profileRoot}`,
+        '- 档案文件: Agent.md / Soul.md / identity.md / user.md',
+        '<redclaw_agent_md>',
+        this.truncate(redClawProfileBundle.files.agent || '', 6000),
+        '</redclaw_agent_md>',
+        '<redclaw_soul_md>',
+        this.truncate(redClawProfileBundle.files.soul || '', 6000),
+        '</redclaw_soul_md>',
+        '<redclaw_identity_md>',
+        this.truncate(redClawProfileBundle.files.identity || '', 4000),
+        '</redclaw_identity_md>',
+        '<redclaw_user_md>',
+        this.truncate(redClawProfileBundle.files.user || '', 8000),
+        '</redclaw_user_md>',
+      );
+
+      if (!redClawProfileBundle.onboardingState.completedAt && redClawProfileBundle.files.bootstrap) {
+        promptParts.push(
+          '',
+          '## RedClaw 首次设定引导状态',
+          `- completed: false`,
+          `- stepIndex: ${redClawProfileBundle.onboardingState.stepIndex || 0}`,
+          '<redclaw_bootstrap>',
+          this.truncate(redClawProfileBundle.files.bootstrap, 3000),
+          '</redclaw_bootstrap>',
+          '当前空间尚未完成首次设定。优先完成偏好采集后再推进复杂任务。',
+        );
+      }
     }
 
     if (metadata.associatedFilePath) {
@@ -1315,6 +1466,13 @@ export class PiChatService {
         '- 产出配图策略后必须调用 `redclaw_save_image_pack` 保存封面图和多张配图提示词。',
         '- 用户给出发布后数据时，必须调用 `redclaw_save_retrospective` 形成复盘并给出下一轮假设与动作。',
         '- 在继续历史任务前，可先调用 `redclaw_list_projects` 选择最近项目。',
+        '',
+        '### RedClaw 自动化能力（强约束）',
+        '- 你具备后台自动化能力：可以创建/修改/删除/执行 定时任务、长周期任务、心跳与后台轮询。',
+        '- 当用户提出“在某时间提醒/报时/定时执行”这类请求时，禁止回答“我无法定时/无法主动发送消息”。必须通过 `app_cli` 配置自动化任务。',
+        '- 标准流程：先 `app_cli(command="redclaw runner-status")` 检查后台状态；若未开启则 `app_cli(command="redclaw runner-start --interval 20")`；然后用 `redclaw schedule-add`/`schedule-update` 完成任务。',
+        '- 配置完成后必须回显：任务名、模式、时间（或间隔）、enabled 状态、nextRunAt（若工具有返回）。',
+        '- 若任务实际回执可能写入任务会话，仍需在当前会话明确说明结果同步策略，避免用户误判“未执行”。',
       );
     }
 

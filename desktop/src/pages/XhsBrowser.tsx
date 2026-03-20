@@ -89,15 +89,34 @@ function parseCountText(value) {
 }
 
 function getNoteTitle() {
-  return (
-    document.querySelector('#detail-title')?.innerText.trim() ||
-    document.querySelector('.title')?.innerText.trim() ||
-    document.querySelector('.note-title')?.innerText.trim() ||
-    '笔记'
-  );
+  const explicitTitle = document.querySelector('#detail-title')?.innerText?.trim();
+  if (explicitTitle) return explicitTitle;
+
+  const root = getCurrentNoteRoot();
+  if (root) {
+    const scopedTitle =
+      root.querySelector('#detail-title')?.innerText?.trim() ||
+      root.querySelector('.note-title')?.innerText?.trim() ||
+      root.querySelector('.title')?.innerText?.trim();
+    if (scopedTitle) return scopedTitle;
+  }
+
+  return '笔记';
 }
 
 function getNoteTextEls() {
+  const root = getCurrentNoteRoot();
+  if (root) {
+    let scoped = Array.from(root.querySelectorAll('#detail-desc .note-text'));
+    if (scoped.length === 0) {
+      scoped = Array.from(root.querySelectorAll('.desc .note-text'));
+    }
+    if (scoped.length === 0) {
+      scoped = Array.from(root.querySelectorAll('.note-content .note-text'));
+    }
+    if (scoped.length > 0) return scoped;
+  }
+
   let els = Array.from(document.querySelectorAll('#detail-desc .note-text'));
   if (els.length === 0) {
     els = Array.from(document.querySelectorAll('.desc .note-text'));
@@ -108,26 +127,313 @@ function getNoteTextEls() {
   return els;
 }
 
-function getCurrentNoteImgEls() {
-  let els = Array.from(document.querySelectorAll('.img-container img'));
-  if (els.length === 0) {
-    els = Array.from(document.querySelectorAll('.note-content .img-container img'));
+function getActiveNoteDetailMask() {
+  const strictMasks = Array.from(document.querySelectorAll('.note-detail-mask[note-id]'));
+  const looseMasks = Array.from(document.querySelectorAll('.note-detail-mask'));
+  const masks = strictMasks.length > 0 ? strictMasks : looseMasks;
+  if (masks.length === 0) return null;
+  const scored = masks
+    .filter((mask) => mask instanceof Element)
+    .map((mask, index) => {
+      const style = window.getComputedStyle(mask);
+      const rect = mask.getBoundingClientRect();
+      const visible = style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 80 && rect.height > 80;
+      const container = mask.querySelector('#noteContainer.note-container, #noteContainer, .note-container');
+      const titleEl = container?.querySelector?.('#detail-title, .note-content #detail-title, .note-content .title');
+      const titleText = (titleEl?.textContent || '').trim();
+      const area = Math.max(0, rect.width * rect.height);
+      let score = 0;
+      if (visible) score += 100000;
+      if (container) score += 10000;
+      if (titleText) score += 1000;
+      score += Math.floor(area / 100);
+      score += index; // newer node tends to be later in DOM
+      return { mask, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.mask || masks[masks.length - 1] || null;
+}
+
+function getCurrentOpenedNoteId() {
+  const mask = getActiveNoteDetailMask();
+  if (!mask) return '';
+  const id = mask.getAttribute('note-id') || '';
+  return id.trim();
+}
+
+function getCurrentStateNoteEntry() {
+  try {
+    const detailMap = getInitialState()?.note?.noteDetailMap || {};
+    const keys = Object.keys(detailMap);
+    if (keys.length === 0) return null;
+
+    const candidates = [];
+    const openedNoteId = getCurrentOpenedNoteId();
+    if (openedNoteId) candidates.push(openedNoteId);
+    const pathPart = location.pathname.split('/').filter(Boolean).pop() || '';
+    if (pathPart) candidates.push(pathPart);
+    try {
+      const search = new URLSearchParams(location.search);
+      ['noteId', 'note_id', 'id', 'itemId'].forEach((name) => {
+        const value = search.get(name);
+        if (value) candidates.push(value);
+      });
+    } catch {}
+
+    const uniqCandidates = Array.from(new Set(candidates.filter(Boolean)));
+    for (const candidate of uniqCandidates) {
+      if (detailMap[candidate]) return detailMap[candidate];
+      const matchedKey = keys.find((key) => key === candidate || key.includes(candidate) || candidate.includes(key));
+      if (matchedKey) return detailMap[matchedKey];
+      const matchedByEntry = keys.find((key) => {
+        const entry = detailMap[key];
+        const note = entry?.note || entry;
+        const entryIds = [note?.noteId, note?.id, entry?.noteId, entry?.id]
+          .filter(Boolean)
+          .map((id) => String(id));
+        return entryIds.some((id) => id === candidate || id.includes(candidate) || candidate.includes(id));
+      });
+      if (matchedByEntry) return detailMap[matchedByEntry];
+    }
+
+    const normalize = (value) => String(value || '').replace(/\\s+/g, '').trim();
+    const currentTitle = normalize(getNoteTitle());
+    if (currentTitle) {
+      const titleMatchedKey = keys.find((key) => {
+        const entry = detailMap[key];
+        const note = entry?.note || entry;
+        const entryTitle = normalize(note?.title || note?.noteTitle || '');
+        return entryTitle && (entryTitle === currentTitle || entryTitle.includes(currentTitle) || currentTitle.includes(entryTitle));
+      });
+      if (titleMatchedKey) return detailMap[titleMatchedKey];
+    }
+
+    const hasVisibleMainVideo = Boolean(getCurrentMainVideoElement());
+    if (hasVisibleMainVideo) {
+      const videoMatchedKey = keys.find((key) => {
+        const entry = detailMap[key];
+        const note = entry?.note || entry;
+        const typeHint = String(note?.type || note?.noteType || '').toLowerCase();
+        if (typeHint.includes('video')) return true;
+        if (note?.video && typeof note.video === 'object') return true;
+        const masterUrl = findKeyInObject(note, 'masterUrl');
+        return typeof masterUrl === 'string' && /^https?:\\/\\//i.test(masterUrl);
+      });
+      if (videoMatchedKey) return detailMap[videoMatchedKey];
+    }
+
+    if (keys.length === 1) {
+      return detailMap[keys[0]];
+    }
+    return null;
+  } catch (e) {
+    console.warn('[XHS] resolve state note entry failed', e);
+    return null;
   }
-  return els;
+}
+
+function getCurrentStateNote() {
+  const entry = getCurrentStateNoteEntry();
+  return entry?.note || entry || null;
+}
+
+function normalizeTitle(value) {
+  return String(value || '').replace(/\\s+/g, '').trim();
+}
+
+function isStateAlignedWithDomTitle() {
+  const note = getCurrentStateNote();
+  if (!note) return false;
+  const openedNoteId = getCurrentOpenedNoteId();
+  const stateIds = [note?.noteId, note?.id, note?.note_id]
+    .filter(Boolean)
+    .map((id) => String(id).trim());
+  if (openedNoteId && stateIds.length > 0) {
+    return stateIds.some((id) => id === openedNoteId || id.includes(openedNoteId) || openedNoteId.includes(id));
+  }
+  const domTitle = normalizeTitle(getNoteTitle());
+  const stateTitle = normalizeTitle(note?.title || note?.noteTitle || '');
+  if (domTitle && stateTitle) {
+    return domTitle === stateTitle || domTitle.includes(stateTitle) || stateTitle.includes(domTitle);
+  }
+  if (domTitle && !stateTitle) {
+    return false;
+  }
+  return true;
+}
+
+function isCommentRelatedNode(el) {
+  if (!el || !el.closest) return false;
+  return Boolean(
+    el.closest('.comments-el') ||
+    el.closest('.comment-list') ||
+    el.closest('.comment-item') ||
+    el.closest('.comment-container') ||
+    el.closest('.comments-container') ||
+    el.closest('[class*="comment"]') ||
+    el.closest('[id*="comment"]')
+  );
+}
+
+function getCurrentNoteRoot() {
+  const directRoot =
+    document.querySelector('#noteContainer.note-container[data-render-status]') ||
+    document.querySelector('#noteContainer.note-container') ||
+    document.querySelector('#noteContainer');
+  if (directRoot) {
+    return directRoot;
+  }
+
+  const mask = getActiveNoteDetailMask();
+  if (mask) {
+    const scoped =
+      mask.querySelector('#noteContainer.note-container') ||
+      mask.querySelector('#noteContainer') ||
+      mask.querySelector('.note-container') ||
+      null;
+    if (scoped) return scoped;
+  }
+
+  const anchor =
+    document.querySelector('#detail-desc') ||
+    document.querySelector('#detail-title') ||
+    document.querySelector('.note-content') ||
+    null;
+  if (!anchor) return null;
+  return (
+    anchor.closest('#noteContainer.note-container') ||
+    anchor.closest('#noteContainer') ||
+    anchor.closest('.note-container') ||
+    anchor.closest('#detail-container') ||
+    anchor.closest('.note-content') ||
+    anchor.closest('[class*="note-container"]') ||
+    anchor.closest('[class*="note-content"]') ||
+    anchor.parentElement ||
+    null
+  );
+}
+
+function isNodeVisible(el) {
+  if (!el || !(el instanceof Element)) return false;
+  const style = window.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) {
+    return false;
+  }
+  const rect = el.getBoundingClientRect();
+  return rect.width > 24 && rect.height > 24;
+}
+
+function isLivePhotoNote() {
+  const root = getCurrentNoteRoot();
+  if (!root) return false;
+  return Boolean(root.querySelector('img.live-img, .live-img.live-img-visible, [class*="live-img"]'));
+}
+
+function getCurrentMainVideoElement() {
+  const root = getCurrentNoteRoot();
+  if (!root) return null;
+  const candidates = Array.from(root.querySelectorAll('video, video[mediatype="video"], .xgplayer video'));
+  const visible = candidates.find((el) => !isCommentRelatedNode(el) && isNodeVisible(el));
+  if (visible) return visible;
+  const tagged = candidates.find((el) => {
+    if (isCommentRelatedNode(el)) return false;
+    if (el.getAttribute('mediatype') === 'video') return true;
+    const src = (el.getAttribute('src') || '').trim();
+    if (src.startsWith('blob:')) return true;
+    if (/^https?:\\/\\//i.test(src)) return true;
+    const hasSource = el.querySelector('source[src^="blob:"], source[src^="http"]');
+    return Boolean(hasSource);
+  });
+  return tagged || null;
+}
+
+function getCurrentNoteImgEls() {
+  const root = getCurrentNoteRoot();
+  let els = root
+    ? Array.from(root.querySelectorAll('.img-container img, .note-content .img-container img, .swiper-slide img'))
+    : [];
+  if (els.length === 0) {
+    els = Array.from(document.querySelectorAll('.note-content .img-container img, .img-container img, .swiper-slide img'));
+  }
+  return els.filter((img) => {
+    if (isCommentRelatedNode(img)) return false;
+    if (img.closest('.avatar,[class*="avatar"]')) return false;
+    const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+    return /^https?:\\/\\//i.test(src);
+  });
+}
+
+function getImageUrlsFromState() {
+  const urls = [];
+  const note = getCurrentStateNote();
+  if (!note) return urls;
+  if (!isStateAlignedWithDomTitle()) return urls;
+
+  const imageList = Array.isArray(note?.imageList)
+    ? note.imageList
+    : Array.isArray(note?.images)
+      ? note.images
+      : [];
+
+  imageList.forEach((item) => {
+    if (typeof item === 'string') {
+      pushUniqueUrl(urls, item);
+      return;
+    }
+    pushUniqueUrl(urls, item?.urlDefault);
+    pushUniqueUrl(urls, item?.urlPre);
+    pushUniqueUrl(urls, item?.url);
+    pushUniqueUrl(urls, item?.urlDefaultWebp);
+    if (Array.isArray(item?.infoList)) {
+      item.infoList.forEach((info) => {
+        pushUniqueUrl(urls, info?.url);
+        pushUniqueUrl(urls, info?.urlPre);
+      });
+    }
+  });
+
+  return urls;
+}
+
+function getCurrentNoteImageUrls() {
+  const urls = [];
+  const stateImageUrls = getImageUrlsFromState();
+  stateImageUrls.forEach((url) => pushUniqueUrl(urls, url));
+  if (urls.length > 0) return urls;
+
+  getCurrentNoteImgEls().forEach((img) => {
+    pushUniqueUrl(urls, img.getAttribute('src') || img.getAttribute('data-src') || '');
+  });
+  if (urls.length > 0) return urls;
+
+  const root = getCurrentNoteRoot();
+  if (root) {
+    const bgEls = Array.from(root.querySelectorAll('.swiper-slide[style*="background"], .swiper-slide[style*="background-image"]'));
+    bgEls.forEach((el) => {
+      const styleText = el.getAttribute('style') || '';
+      const matched = styleText.match(/url\\((['"]?)(https?:\\/\\/[^)'"]+)\\1\\)/i);
+      if (matched && matched[2]) {
+        pushUniqueUrl(urls, matched[2]);
+      }
+    });
+  }
+
+  return urls;
 }
 
 function getCoverImageUrl() {
-  const metaOg = document.querySelector('meta[property="og:image"], meta[name="og:image"]');
-  if (metaOg && metaOg.getAttribute('content')) {
-    return metaOg.getAttribute('content');
-  }
-  const videoEl = document.querySelector('video');
+  const videoEl = getCurrentNoteRoot()?.querySelector('video') || document.querySelector('.note-content video');
   if (videoEl && videoEl.getAttribute('poster')) {
     return videoEl.getAttribute('poster');
   }
-  const firstImg = getCurrentNoteImgEls()[0];
-  if (firstImg) {
-    return firstImg.getAttribute('src') || firstImg.getAttribute('data-src');
+  const firstImageUrl = getCurrentNoteImageUrls()[0];
+  if (firstImageUrl) {
+    return firstImageUrl;
+  }
+  const metaOg = document.querySelector('meta[property="og:image"], meta[name="og:image"]');
+  if (metaOg && metaOg.getAttribute('content')) {
+    return metaOg.getAttribute('content');
   }
   return null;
 }
@@ -174,50 +480,121 @@ function pushUniqueUrl(list, value) {
 
 function getVideoUrlsFromState() {
   const urls = [];
-  const state = getInitialState();
-  if (!state) return urls;
-  try {
-    const detailMap = state?.note?.noteDetailMap || {};
-    const keys = Object.keys(detailMap);
-    if (keys.length > 0) {
-      const currentId = location.pathname.split('/').pop();
-      const targetId = keys.find(k => k === currentId) || keys[0];
-      const noteItem = detailMap[targetId];
-      const stream = noteItem?.note?.video?.media?.stream?.h264;
-      if (Array.isArray(stream) && stream.length > 0) {
-        stream.forEach((item) => {
-          pushUniqueUrl(urls, item?.masterUrl);
-          if (Array.isArray(item?.backupUrls)) {
-            item.backupUrls.forEach((backup) => pushUniqueUrl(urls, backup));
-          }
-        });
+  const note = getCurrentStateNote();
+  if (!note) return urls;
+
+  const videoNode = note?.video || null;
+  const h264 = videoNode?.media?.stream?.h264;
+  const h265 = videoNode?.media?.stream?.h265;
+
+  const collectStreams = (streamList) => {
+    if (!Array.isArray(streamList)) return;
+    streamList.forEach((item) => {
+      pushUniqueUrl(urls, item?.masterUrl);
+      if (Array.isArray(item?.backupUrls)) {
+        item.backupUrls.forEach((backup) => pushUniqueUrl(urls, backup));
       }
+    });
+  };
+
+  collectStreams(h264);
+  collectStreams(h265);
+
+  pushUniqueUrl(urls, videoNode?.media?.masterUrl);
+  pushUniqueUrl(urls, videoNode?.media?.url);
+  pushUniqueUrl(urls, videoNode?.url);
+
+  try {
+    const masterUrl = findKeyInObject(note, 'masterUrl');
+    if (typeof masterUrl === 'string') {
+      pushUniqueUrl(urls, masterUrl);
+    }
+    const backups = findKeyInObject(note, 'backupUrls');
+    if (Array.isArray(backups)) {
+      backups.forEach((backup) => pushUniqueUrl(urls, backup));
     }
   } catch (e) {
-    console.warn('[XHS] parse state video failed, fallback to DFS', e);
+    console.warn('[XHS] parse state video failed', e);
   }
 
-  const masterUrl = findKeyInObject(state, 'masterUrl');
-  if (masterUrl) pushUniqueUrl(urls, masterUrl);
+  return urls;
+}
 
-  const backups = findKeyInObject(state, 'backupUrls');
-  if (Array.isArray(backups) && backups.length > 0) {
-    backups.forEach((backup) => pushUniqueUrl(urls, backup));
+function hasVideoShapeInState(note) {
+  if (!note || typeof note !== 'object') return false;
+  const videoNode = note?.video;
+  if (videoNode && typeof videoNode === 'object') {
+    if (videoNode?.media || videoNode?.stream || videoNode?.consumer) return true;
+    if (Array.isArray(videoNode) && videoNode.length > 0) return true;
   }
+  return false;
+}
 
+function hasVideoInState() {
+  const note = getCurrentStateNote();
+  if (!note) return false;
+  if (isLivePhotoNote()) return false;
+  if (!isStateAlignedWithDomTitle()) return false;
+  const typeHint = String(note?.type || note?.noteType || '').toLowerCase();
+  if (typeHint.includes('video')) return true;
+  if (hasVideoShapeInState(note)) return true;
+  return getVideoUrlsFromState().length > 0;
+}
+
+function hasCurrentNoteVideoElement() {
+  if (isLivePhotoNote()) return false;
+  return Boolean(getCurrentMainVideoElement());
+}
+
+function getVideoUrlsFromPerformance() {
+  const urls = [];
+  try {
+    const entries = performance.getEntriesByType('resource') || [];
+    entries.forEach((entry) => {
+      const name = entry && typeof entry.name === 'string' ? entry.name : '';
+      if (!name || !/^https?:\\/\\//i.test(name)) return;
+      const lower = name.toLowerCase();
+      const looksLikeVideo =
+        lower.includes('.mp4') ||
+        lower.includes('.m3u8') ||
+        lower.includes('/hls/') ||
+        lower.includes('/video/') ||
+        lower.includes('sns-video') ||
+        lower.includes('xhscdn');
+      if (looksLikeVideo) {
+        pushUniqueUrl(urls, name);
+      }
+    });
+  } catch (e) {
+    console.warn('[XHS] parse performance video failed', e);
+  }
+  return urls;
+}
+
+function getCurrentNoteVideoUrlsFromDom() {
+  const urls = [];
+  const root = getCurrentNoteRoot();
+  const videoEls = root
+    ? Array.from(root.querySelectorAll('video'))
+    : [];
+  videoEls.forEach((videoEl) => {
+    if (isCommentRelatedNode(videoEl)) return;
+    pushUniqueUrl(urls, videoEl?.src || '');
+    const sourceEls = Array.from(videoEl.querySelectorAll('source'));
+    sourceEls.forEach((source) => pushUniqueUrl(urls, source?.src || ''));
+  });
   return urls;
 }
 
 function getCurrentNoteVideoUrls() {
   const urls = [];
   getVideoUrlsFromState().forEach((url) => pushUniqueUrl(urls, url));
-
-  const videoEls = Array.from(document.querySelectorAll('video'));
-  videoEls.forEach((videoEl) => {
-    pushUniqueUrl(urls, videoEl?.src || '');
-    const sourceEls = Array.from(videoEl.querySelectorAll('source'));
-    sourceEls.forEach((source) => pushUniqueUrl(urls, source?.src || ''));
-  });
+  if (urls.length > 0) return urls;
+  if (hasCurrentNoteVideoElement()) {
+    getVideoUrlsFromPerformance().forEach((url) => pushUniqueUrl(urls, url));
+    if (urls.length > 0) return urls;
+  }
+  getCurrentNoteVideoUrlsFromDom().forEach((url) => pushUniqueUrl(urls, url));
 
   return urls;
 }
@@ -238,7 +615,10 @@ function hasNoteDataInState() {
 
 function getAuthorInfo() {
   try {
-    const infoEl = document.querySelector('.info');
+    const root = getCurrentNoteRoot();
+    const infoEl = root
+      ? (root.querySelector('.author .info') || root.querySelector('.author-wrapper .info') || root.querySelector('.info'))
+      : document.querySelector('.info');
     if (!infoEl) return null;
 
     const usernameEl = infoEl.querySelector('.username');
@@ -265,22 +645,20 @@ function getAuthorInfo() {
 const DETECT_NOTE_SCRIPT = `
 (() => {
   ${XHS_SHARED_SCRIPT}
-  const textSelectors = [
-    '#detail-desc .note-text',
-    '.desc .note-text',
-    '.note-content .note-text'
-  ];
-
-  const hasText = textSelectors.some((selector) => !!document.querySelector(selector));
-  const imageCount = getCurrentNoteImgEls().length;
-  const videoUrls = getCurrentNoteVideoUrls();
-  const videoCount = videoUrls.length;
+  const hasText = getNoteTextEls().length > 0;
+  const hasContainer = Boolean(getCurrentNoteRoot());
+  const stateImageUrls = getImageUrlsFromState();
+  const imageCount = stateImageUrls.length > 0 ? stateImageUrls.length : getCurrentNoteImgEls().length;
+  const primaryVideoUrl = getCurrentNoteVideoUrl();
+  const stateHasVideo = hasVideoInState();
+  const hasDomVideoElement = hasCurrentNoteVideoElement();
+  const livePhoto = isLivePhotoNote();
   const hasImage = imageCount > 0;
-  const hasVideo = videoCount > 0;
+  const hasVideo = stateHasVideo || hasDomVideoElement || Boolean(primaryVideoUrl);
   const hasStateData = hasNoteDataInState();
-  const isNote = hasText || hasImage || hasVideo || hasStateData;
-  // 规则：只有 1 个视频且无图片时才判定为视频笔记
-  const isVideoNote = videoCount === 1 && imageCount === 0;
+  const isNote = hasContainer || hasText || hasImage || hasVideo || hasStateData;
+  // 优先以当前笔记 state 的视频字段判定；仅在 state 缺失时回退到 DOM 媒体启发式
+  const isVideoNote = !livePhoto && (stateHasVideo || hasDomVideoElement || (Boolean(primaryVideoUrl) && imageCount <= 1));
 
   return {
     isNote,
@@ -302,13 +680,13 @@ const GET_NOTE_DATA_SCRIPT = `
     .join('\\n\\n');
   const authorInfo = getAuthorInfo();
 
-  const images = getCurrentNoteImgEls()
-    .map((img) => img.getAttribute('src') || img.getAttribute('data-src'))
-    .filter((src) => src && src.startsWith('https://'))
-    .slice(0, 9);
+  const images = getCurrentNoteImageUrls().slice(0, 9);
   const videoUrls = getCurrentNoteVideoUrls();
-  // 规则：只有 1 个视频且无图片时才保留视频链接；其余情况按图文处理（丢弃 live mp4）
-  const isVideoNote = videoUrls.length === 1 && images.length === 0;
+  const stateHasVideo = hasVideoInState();
+  const hasDomVideoElement = hasCurrentNoteVideoElement();
+  const livePhoto = isLivePhotoNote();
+  // 优先以 state 判断视频笔记，避免评论区/推荐区媒体干扰
+  const isVideoNote = !livePhoto && (stateHasVideo || hasDomVideoElement || (videoUrls.length > 0 && images.length <= 1));
   const selectedVideoUrl = isVideoNote ? videoUrls[0] : null;
 
   let stats = { likes: 0, collects: 0 };
@@ -541,6 +919,13 @@ function ManagedWebview({
         host.appendChild(webview);
         webviewRef.current = webview;
         onRefChange(tab.id, webview);
+        try {
+            if (typeof webview.setMaxListeners === 'function') {
+                webview.setMaxListeners(32);
+            }
+        } catch {
+            // ignore
+        }
 
         return () => {
             onRefChange(tab.id, null);
@@ -737,11 +1122,31 @@ export function XhsBrowser() {
         updateTab(tabId, patch);
     }, [updateTab]);
 
-    const checkForNote = useCallback(async (tabId: string) => {
-        const result = await runScriptInTab<NoteDetection>(tabId, DETECT_NOTE_SCRIPT);
-        if (!result) return;
+    const checkForNote = useCallback(async (
+        tabId: string,
+        options?: { retries?: number; intervalMs?: number }
+    ) => {
+        const retries = options?.retries ?? 4;
+        const intervalMs = options?.intervalMs ?? 260;
+        let latest: NoteDetection | null = null;
 
-        updateTab(tabId, { note: result });
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            const result = await runScriptInTab<NoteDetection>(tabId, DETECT_NOTE_SCRIPT);
+            if (result) {
+                latest = result;
+                const normalizedTitle = (result.title || '').trim();
+                const hasReliableTitle = normalizedTitle.length > 0 && normalizedTitle !== '笔记';
+                if (result.isNote && (hasReliableTitle || attempt === retries)) {
+                    break;
+                }
+            }
+            if (attempt < retries) {
+                await new Promise((resolve) => window.setTimeout(resolve, intervalMs));
+            }
+        }
+
+        if (!latest) return;
+        updateTab(tabId, { note: latest });
     }, [runScriptInTab, updateTab]);
 
     const injectSaveButton = useCallback(async (tabId: string) => {
@@ -775,7 +1180,22 @@ export function XhsBrowser() {
         setTabSaveStatus(tabId, 'saving');
 
         try {
-            const noteData = await runScriptInTab<NotePayload>(tabId, GET_NOTE_DATA_SCRIPT);
+            let noteData: NotePayload | null = null;
+            for (let attempt = 0; attempt < 5; attempt++) {
+                const result = await runScriptInTab<NotePayload>(tabId, GET_NOTE_DATA_SCRIPT);
+                if (result) {
+                    noteData = result;
+                    const title = (result.title || '').trim();
+                    const hasValidTitle = title.length > 0 && title !== '笔记';
+                    const hasMedia = Array.isArray(result.images) && result.images.length > 0;
+                    const hasText = Boolean(result.content?.trim());
+                    const hasVideo = Boolean(result.videoUrl);
+                    if (hasValidTitle && (hasMedia || hasText || hasVideo)) {
+                        break;
+                    }
+                }
+                await new Promise((resolve) => window.setTimeout(resolve, 280));
+            }
             if (!noteData) {
                 throw new Error('未获取到笔记数据');
             }
@@ -788,20 +1208,26 @@ export function XhsBrowser() {
                 throw new Error('笔记内容为空');
             }
 
-            const response = await fetch(NOTES_API, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(noteData),
-            });
-
-            const result = await response.json().catch(() => null) as { success?: boolean; error?: string } | null;
-
-            if (!response.ok || result?.success === false) {
-                throw new Error(result?.error || '保存失败');
+            const ipcResult = await window.ipcRenderer.invoke('xhs:save-note', noteData) as { success?: boolean; error?: string } | null;
+            if (!ipcResult || ipcResult.success === false) {
+                const controller = new AbortController();
+                const timeout = window.setTimeout(() => controller.abort(), 15000);
+                const response = await fetch(NOTES_API, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(noteData),
+                    signal: controller.signal,
+                }).finally(() => {
+                    window.clearTimeout(timeout);
+                });
+                const result = await response.json().catch(() => null) as { success?: boolean; error?: string } | null;
+                if (!response.ok || result?.success === false) {
+                    throw new Error(result?.error || ipcResult?.error || '保存失败');
+                }
             }
 
             setTabSaveStatus(tabId, 'success', true);
-            await checkForNote(tabId);
+            await checkForNote(tabId, { retries: 2, intervalMs: 180 });
         } catch (error) {
             console.error('[XHS] 保存失败:', error);
             setTabSaveStatus(tabId, 'error', true);
@@ -856,6 +1282,17 @@ export function XhsBrowser() {
             window.ipcRenderer.off('xhs:open-in-tab', handleOpenInTab);
         };
     }, [openNewTabWithDedupe]);
+
+    useEffect(() => {
+        const timer = window.setInterval(() => {
+            const tab = tabs.find(item => item.id === activeTabId);
+            if (!tab) return;
+            if (tab.isLoading) return;
+            if (!tab.url.includes('xiaohongshu.com')) return;
+            void checkForNote(tab.id, { retries: 1, intervalMs: 180 });
+        }, 1800);
+        return () => window.clearInterval(timer);
+    }, [tabs, activeTabId, checkForNote]);
 
     const handleCloseTab = useCallback((tabId: string) => {
         clearTimersForTab(tabId);
@@ -1095,7 +1532,8 @@ export function XhsBrowser() {
                     <button
                         onClick={() => {
                             if (!activeTabId) return;
-                            void checkForNote(activeTabId);
+                            void forceTabLayout(activeTabId);
+                            void checkForNote(activeTabId, { retries: 6, intervalMs: 220 });
                             void injectSaveButton(activeTabId);
                         }}
                         className="flex items-center gap-1 h-8 px-3 text-xs text-text-secondary hover:text-text-primary border border-border rounded-md hover:bg-surface-primary transition-colors"
