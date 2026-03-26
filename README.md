@@ -102,7 +102,9 @@
 ## 社区
 
 <p align="center">
-  <img src="./images/wechatgroup.png" alt="RedBox WeChat Group" width="35%">
+  <a href="./images/wechatgroup.png">
+    <img src="./images/wechatgroup.png" alt="RedBox WeChat Group" width="35%">
+  </a>
 </p>
 
 ## 更新日志
