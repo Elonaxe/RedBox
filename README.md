@@ -101,11 +101,9 @@
 
 ## 社区
 
-<p align="center">
-  <a href="./images/wechatgroup.png">
-    <img src="https://img.shields.io/badge/WeChat-加入微信群-07C160?style=for-the-badge&logo=wechat&logoColor=white">
-  </a>
-</p>
+<a href="./images/wechatgroup.png">
+  <img src="https://img.shields.io/badge/WeChat-加入微信群-07C160?style=for-the-badge&logo=wechat&logoColor=white">
+</a>
 
 ## 更新日志
 
